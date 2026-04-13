@@ -16,6 +16,7 @@
 #include <functional>
 #include <utility>
 #include <vector>
+#include <atomic>
 
 #include "common/util/hash_util.h"
 
@@ -103,6 +104,10 @@ class CountMinSketch {
   }
 
   /** @todo (student) can add their data structures that support count-min sketch operations */
+  // std::vector<std::vector<uint32_t>> sketch_matrix_;  // 2D vector for count-min sketch counts
+  // (row, col) idx = row * width_ + col
+  std::vector<std::atomic<uint32_t>> sketch_matrix_;
+  
 };
 
 }  // namespace bustub
