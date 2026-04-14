@@ -34,6 +34,7 @@ struct FrameStatus {
   frame_id_t frame_id_;
   bool evictable_;
   ArcStatus arc_status_;
+  std::list<frame_id_t>::iterator it_;
   FrameStatus(page_id_t pid, frame_id_t fid, bool ev, ArcStatus st)
       : page_id_(pid), frame_id_(fid), evictable_(ev), arc_status_(st) {}
 };
@@ -62,29 +63,31 @@ class ArcReplacer {
 
  private:
   // TODO(student): implement me! You can replace or remove these member variables as you like.
-  std::list<frame_id_t> mru_;
-  std::list<frame_id_t> mfu_;
-  std::list<page_id_t> mru_ghost_;
+  std::list<frame_id_t> mru_;   // 最近使用，当前还在缓存中，最近被访问过
+  std::list<frame_id_t> mfu_;   // 最频繁使用，当前还在缓存里，被访问过不止一次
+  std::list<page_id_t> mru_ghost_;  // 幽灵列表，记录被淘汰的页
   std::list<page_id_t> mfu_ghost_;
 
   /* record entries in mru_ and mfu_
    * this uses frame_id_t to guarantee no duplicate records for the same
    * frame when they are alive */
-  std::unordered_map<frame_id_t, std::shared_ptr<FrameStatus>> alive_map_;
+  std::unordered_map<frame_id_t, std::shared_ptr<FrameStatus>> alive_map_; // 记录 mru_ / mfu_ 中的条目
   /* record entries in mru_ghost_ and mfu_ghost_
    * this uses page_id_t but not frame_id_t because page_id is the unique
    * identifier in ghost lists */
-  std::unordered_map<page_id_t, std::shared_ptr<FrameStatus>> ghost_map_;
+  std::unordered_map<page_id_t, std::shared_ptr<FrameStatus>> ghost_map_; // 记录 ghost 列表中的条目
 
   /* alive, evictable entries count */
   [[maybe_unused]] size_t curr_size_{0};
   /* p as in original paper */
-  [[maybe_unused]] size_t mru_target_size_{0};
+  [[maybe_unused]] size_t mru_target_size_{0}; // mru_ 的目标大小(论文中的 p)，动态调整
   /* c as in original paper */
-  [[maybe_unused]] size_t replacer_size_;
+  [[maybe_unused]] size_t replacer_size_; // 总容量上限 （论文中的 c）
   std::mutex latch_;
 
   // TODO(student): You can add member variables / functions as you like.
+
+  void Dieout(std::unordered_map<frame_id_t, std::shared_ptr<FrameStatus>>::const_iterator it, std::list<frame_id_t>&list_, std::list<page_id_t>&list_ghost_);
 };
 
 }  // namespace bustub
