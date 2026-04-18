@@ -95,6 +95,7 @@ class FrameHeader {
    * currently storing. This might allow you to skip searching for the corresponding (page ID, frame ID) pair somewhere
    * else in the buffer pool manager...
    */
+   page_id_t page_id_;
 };
 
 /**
@@ -138,22 +139,22 @@ class BufferPoolManager {
    *
    * TODO(P1) We recommend replacing this comment with details about what this latch actually protects.
    */
-  std::shared_ptr<std::mutex> bpm_latch_;
+  std::shared_ptr<std::mutex> bpm_latch_; // 这是一把粗粒度的互斥锁，保护的是 BPM 的内部数据结构
 
   /** @brief The frame headers of the frames that this buffer pool manages. */
   std::vector<std::shared_ptr<FrameHeader>> frames_;
 
   /** @brief The page table that keeps track of the mapping between pages and buffer pool frames. */
-  std::unordered_map<page_id_t, frame_id_t> page_table_;
+  std::unordered_map<page_id_t, frame_id_t> page_table_; // page_id -> frame_id 的映射
 
   /** @brief A list of free frames that do not hold any page's data. */
-  std::list<frame_id_t> free_frames_;
+  std::list<frame_id_t> free_frames_; // 空闲帧列表
 
   /** @brief The replacer to find unpinned / candidate pages for eviction. */
-  std::shared_ptr<ArcReplacer> replacer_;
+  std::shared_ptr<ArcReplacer> replacer_;// 淘汰算法调度器
 
   /** @brief A pointer to the disk scheduler. Shared with the page guards for flushing. */
-  std::shared_ptr<DiskScheduler> disk_scheduler_;
+  std::shared_ptr<DiskScheduler> disk_scheduler_; // 磁盘调度器
 
   /**
    * @brief A pointer to the log manager.

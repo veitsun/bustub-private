@@ -13,6 +13,8 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 
 #include "buffer/arc_replacer.h"
 #include "buffer/buffer_pool_manager.h"
@@ -122,6 +124,8 @@ class ReadPageGuard {
    * If you want extra (nonexistent) style points, and you want to be extra fancy, then you can look into the
    * `std::shared_lock` type and use that for the latching mechanism instead of manually calling `lock` and `unlock`.
    */
+
+   std::shared_lock<std::shared_mutex> page_lock_; // 共享锁
 };
 
 /**
@@ -229,6 +233,9 @@ class WritePageGuard {
    * If you want extra (nonexistent) style points, and you want to be extra fancy, then you can look into the
    * `std::unique_lock` type and use that for the latching mechanism instead of manually calling `lock` and `unlock`.
    */
+   std::unique_lock<std::shared_mutex> page_lock_;  // 独占锁
+
+   // std::mutex 同一时刻，只允许一个线程持有锁，别人都不能进
 };
 
 }  // namespace bustub

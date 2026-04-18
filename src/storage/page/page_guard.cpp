@@ -12,8 +12,13 @@
 
 #include "storage/page/page_guard.h"
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <utility>
+#include <vector>
 #include "buffer/arc_replacer.h"
 #include "common/macros.h"
+#include "storage/disk/disk_scheduler.h"
 
 namespace bustub {
 
@@ -38,7 +43,12 @@ ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> fra
       replacer_(std::move(replacer)),
       bpm_latch_(std::move(bpm_latch)),
       disk_scheduler_(std::move(disk_scheduler)) {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // 对 frame_-> rwlatch_ 这把 shared_mutex 加一个读锁
+  // 然后把锁的拥有权交给这个 shared_lock 对象管理
+  page_lock_ = std::shared_lock<std::shared_mutex>(frame_->rwlatch_); // page_lock_ 用来保存一个共享锁对象
+  is_valid_ = true;
+
 }
 
 /**
@@ -56,7 +66,21 @@ ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> fra
  *
  * @param that The other page guard.
  */
-ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {}
+ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {
+  // 移动构造
+
+  // 转移所有字段
+  page_id_    = that.page_id_;
+  frame_      = std::move(that.frame_);
+  replacer_   = std::move(that.replacer_);
+  bpm_latch_  = std::move(that.bpm_latch_);
+  disk_scheduler_ = std::move(that.disk_scheduler_);
+  page_lock_  = std::move(that.page_lock_); // 锁的所有权也要转移
+  is_valid_   = that.is_valid_;
+
+  // 让 that 失效，防止它析构时 double free
+  that.is_valid_ = false;
+}
 
 /**
  * @brief The move assignment operator for `ReadPageGuard`.
@@ -75,7 +99,23 @@ ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {}
  * @param that The other page guard.
  * @return ReadPageGuard& The newly valid `ReadPageGuard`.
  */
-auto ReadPageGuard::operator=(ReadPageGuard &&that) noexcept -> ReadPageGuard & { return *this; }
+auto ReadPageGuard::operator=(ReadPageGuard &&that) noexcept -> ReadPageGuard & {
+  if(this == &that) return *this;
+
+  Drop();
+
+  // 先释放自己，再接管 that
+  page_id_    = that.page_id_;
+  frame_      = std::move(that.frame_);
+  replacer_   = std::move(that.replacer_);
+  bpm_latch_  = std::move(that.bpm_latch_);
+  disk_scheduler_ = std::move(that.disk_scheduler_);
+  page_lock_  = std::move(that.page_lock_); // 锁的所有权也要转移
+  is_valid_   = that.is_valid_;
+
+  that.is_valid_ = false;
+  return *this;
+}
 
 /**
  * @brief Gets the page ID of the page this guard is protecting.
@@ -106,7 +146,12 @@ auto ReadPageGuard::IsDirty() const -> bool {
  *
  * TODO(P1): Add implementation.
  */
-void ReadPageGuard::Flush() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void ReadPageGuard::Flush() {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // 将脏页写回磁盘，需要用 disk_scheduler_ 发起一个写请求：
+  // ReadPageGuard 持有的是共享读锁，理论上读操作不会修改数据，所以页面不应该是脏的。
+
+}
 
 /**
  * @brief Manually drops a valid `ReadPageGuard`'s data. If this guard is invalid, this function does nothing.
@@ -119,7 +164,27 @@ void ReadPageGuard::Flush() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
  *
  * TODO(P1): Add implementation.
  */
-void ReadPageGuard::Drop() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void ReadPageGuard::Drop() {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  if (!is_valid_) {
+    // 防止 double free
+    return ;
+  }
+  is_valid_ = false;
+
+  // 释放页面锁
+  page_lock_.unlock();
+
+  // 将 frame 的 pin_count 减 1 ， 并在 pin_count 降为 0 时。通知 replacer 该 frame 可以被淘汰
+  {
+    // 先释放页面锁， 再拿 bpm_latch 修改 pin_count ，顺序反了会死锁
+    std::lock_guard<std::mutex> lk(*bpm_latch_);
+    frame_->pin_count_ --;
+    if(frame_->pin_count_ == 0) {
+      replacer_->SetEvictable(frame_->frame_id_, true);
+    }
+  }
+}
 
 /** @brief The destructor for `ReadPageGuard`. This destructor simply calls `Drop()`. */
 ReadPageGuard::~ReadPageGuard() { Drop(); }
@@ -149,7 +214,9 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
       replacer_(std::move(replacer)),
       bpm_latch_(std::move(bpm_latch)),
       disk_scheduler_(std::move(disk_scheduler)) {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  page_lock_ = std::unique_lock<std::shared_mutex>(frame_->rwlatch_);
+  is_valid_ = true;
 }
 
 /**
@@ -167,7 +234,21 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
  *
  * @param that The other page guard.
  */
-WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {}
+WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {
+  // 移动构造
+
+  // 转移所有字段
+  page_id_    = that.page_id_;
+  frame_      = std::move(that.frame_);
+  replacer_   = std::move(that.replacer_);
+  bpm_latch_  = std::move(that.bpm_latch_);
+  disk_scheduler_ = std::move(that.disk_scheduler_);
+  page_lock_  = std::move(that.page_lock_); // 锁的所有权也要转移
+  is_valid_   = that.is_valid_;
+
+  // 让 that 失效，防止它析构时 double free
+  that.is_valid_ = false;
+}
 
 /**
  * @brief The move assignment operator for `WritePageGuard`.
@@ -186,7 +267,24 @@ WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {}
  * @param that The other page guard.
  * @return WritePageGuard& The newly valid `WritePageGuard`.
  */
-auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard & { return *this; }
+auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard & {
+  if(this == &that) return *this;
+
+  Drop();
+
+  // 先释放自己，再接管 that
+  page_id_    = that.page_id_;
+  frame_      = std::move(that.frame_);
+  replacer_   = std::move(that.replacer_);
+  bpm_latch_  = std::move(that.bpm_latch_);
+  disk_scheduler_ = std::move(that.disk_scheduler_);
+  page_lock_  = std::move(that.page_lock_); // 锁的所有权也要转移
+  is_valid_   = that.is_valid_;
+
+  that.is_valid_ = false;
+
+  return *this;
+}
 
 /**
  * @brief Gets the page ID of the page this guard is protecting.
@@ -225,7 +323,22 @@ auto WritePageGuard::IsDirty() const -> bool {
  *
  * TODO(P1): Add implementation.
  */
-void WritePageGuard::Flush() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void WritePageGuard::Flush() {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // 将脏页写回磁盘，需要用 disk_scheduler_ 发起一个写请求：
+  // WritePageGuard 持有独占写锁，有完整的写权限，flush 之后可以安全地把 is_dirty_ 置为false，因为此时没有其他线程能修改这个页面。
+  // std::lock_guard<std::mutex> lk(*bpm_latch_);
+  if(!is_valid_ || !frame_->is_dirty_) return ;
+  frame_->is_dirty_ = false;
+
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  
+  std::vector<DiskRequest> requests;
+  requests.push_back({true, frame_->GetDataMut(), page_id_, std::move(promise)});
+  disk_scheduler_->Schedule(requests);
+  future.get();
+}
 
 /**
  * @brief Manually drops a valid `WritePageGuard`'s data. If this guard is invalid, this function does nothing.
@@ -238,7 +351,27 @@ void WritePageGuard::Flush() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
  *
  * TODO(P1): Add implementation.
  */
-void WritePageGuard::Drop() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void WritePageGuard::Drop() {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+    if (!is_valid_) {
+    // 防止 double free
+    return ;
+  }
+  is_valid_ = false;
+
+  // 释放页面锁
+  page_lock_.unlock();
+
+  // 将 frame 的 pin_count 减 1 ， 并在 pin_count 降为 0 时。通知 replacer 该 frame 可以被淘汰
+  {
+    // 先释放页面锁， 再拿 bpm_latch 修改 pin_count ，顺序反了会死锁
+    std::lock_guard<std::mutex> lk(*bpm_latch_);
+    frame_->pin_count_ --;
+    if(frame_->pin_count_ == 0) {
+      replacer_->SetEvictable(frame_->frame_id_, true);
+    }
+  }
+}
 
 /** @brief The destructor for `WritePageGuard`. This destructor simply calls `Drop()`. */
 WritePageGuard::~WritePageGuard() { Drop(); }
