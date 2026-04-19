@@ -159,6 +159,7 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
     // 不在缓存里
     // 说明在磁盘里，直接通过磁盘调用器，删除磁盘空间
     disk_scheduler_->DeallocatePage(page_id);
+    bpm_latch_->unlock();
     return true;
   }
   // 否则是在 buffer pool 中的
@@ -279,60 +280,60 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     // 数据已经在 frame 里了，这时返回一个 WritePageGuard
     return WritePageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
   }
-  else {
-    // 没有空闲 frame，需要驱逐
-    auto victim = replacer_->Evict();
-    if(!victim.has_value()) {
-      return std::nullopt; // 内存不足
-    }
-    auto frame_id = victim.value();
+  // else {
+  // 没有空闲 frame，需要驱逐
+  auto victim = replacer_->Evict();
+  if(!victim.has_value()) {
+    return std::nullopt; // 内存不足
+  }
+  auto frame_id = victim.value();
 
 
-    // if 被驱逐的页是脏页，需要先写回磁盘
-    auto frame = frames_[frame_id];
-    if(frame->is_dirty_) {
-      // 找到旧的 page_id 
-      auto old_page_id = frame->page_id_;
+  // if 被驱逐的页是脏页，需要先写回磁盘
+  auto frame = frames_[frame_id];
+  if(frame->is_dirty_) {
+    // 找到旧的 page_id 
+    auto old_page_id = frame->page_id_;
 
-      frame->is_dirty_ = false; // 先清标记，防止并发重复写
-      bpm_latch_->unlock(); // 释放锁再做 IO
+    frame->is_dirty_ = false; // 先清标记，防止并发重复写
+    bpm_latch_->unlock(); // 释放锁再做 IO
 
-      auto promise = disk_scheduler_->CreatePromise();
-      auto future = promise.get_future();
-
-      std::vector<DiskRequest> requests;
-      requests.push_back({true, frame->GetDataMut(), old_page_id, std::move(promise)});
-
-      disk_scheduler_->Schedule(requests);
-      future.get(); // 等待写完成
-
-      bpm_latch_->lock(); // 这里需要重新拿锁
-    }
-    // 删除旧的 page_table_ 映射
-    page_table_.erase(frame->page_id_);
-
-    // 建立新的 page_table_ 映射
-    // auto frame
-    frame->Reset();
-    frame->page_id_ = page_id;
-    page_table_[page_id] = frame_id;
-
-    frame->pin_count_.store(1);
-    replacer_->RecordAccess(frame_id, page_id, access_type);
-    replacer_->SetEvictable(frame_id, false);
-
-    bpm_latch_->unlock();
-    // 从磁盘读入页面数据
     auto promise = disk_scheduler_->CreatePromise();
     auto future = promise.get_future();
+
     std::vector<DiskRequest> requests;
-    requests.push_back({false, frame->GetDataMut(), page_id, std::move(promise)});
+    requests.push_back({true, frame->GetDataMut(), old_page_id, std::move(promise)});
 
     disk_scheduler_->Schedule(requests);
-    future.get(); // 等待读完成
+    future.get(); // 等待写完成
 
-    return WritePageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+    bpm_latch_->lock(); // 这里需要重新拿锁
   }
+  // 删除旧的 page_table_ 映射
+  page_table_.erase(frame->page_id_);
+
+  // 建立新的 page_table_ 映射
+  // auto frame
+  frame->Reset();
+  frame->page_id_ = page_id;
+  page_table_[page_id] = frame_id;
+
+  frame->pin_count_.store(1);
+  replacer_->RecordAccess(frame_id, page_id, access_type);
+  replacer_->SetEvictable(frame_id, false);
+
+  bpm_latch_->unlock();
+  // 从磁盘读入页面数据
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  std::vector<DiskRequest> requests;
+  requests.push_back({false, frame->GetDataMut(), page_id, std::move(promise)});
+
+  disk_scheduler_->Schedule(requests);
+  future.get(); // 等待读完成
+
+  return WritePageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+  // }
 
   // bpm_latch_->unlock();
 }
@@ -414,60 +415,60 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
     // 数据已经在 frame 里了，这时返回一个 WritePageGuard
     return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
   }
-  else {
-    // 没有空闲 frame，需要驱逐
-    auto victim = replacer_->Evict();
-    if(!victim.has_value()) {
-      return std::nullopt; // 内存不足
-    }
-    auto frame_id = victim.value();
+  // else {
+  // 没有空闲 frame，需要驱逐
+  auto victim = replacer_->Evict();
+  if(!victim.has_value()) {
+    return std::nullopt; // 内存不足
+  }
+  auto frame_id = victim.value();
 
 
-    // if 被驱逐的页是脏页，需要先写回磁盘
-    auto frame = frames_[frame_id];
-    if(frame->is_dirty_) {
-      // 找到旧的 page_id 
-      auto old_page_id = frame->page_id_;
+  // if 被驱逐的页是脏页，需要先写回磁盘
+  auto frame = frames_[frame_id];
+  if(frame->is_dirty_) {
+    // 找到旧的 page_id 
+    auto old_page_id = frame->page_id_;
 
-      frame->is_dirty_ = false; // 先清标记，防止并发重复写
-      bpm_latch_->unlock(); // 释放锁再做 IO
+    frame->is_dirty_ = false; // 先清标记，防止并发重复写
+    bpm_latch_->unlock(); // 释放锁再做 IO
 
-      auto promise = disk_scheduler_->CreatePromise();
-      auto future = promise.get_future();
-
-      std::vector<DiskRequest> requests;
-      requests.push_back({true, frame->GetDataMut(), old_page_id, std::move(promise)});
-
-      disk_scheduler_->Schedule(requests);
-      future.get(); // 等待写完成
-
-      bpm_latch_->lock(); // 这里需要重新拿锁
-    }
-    // 删除旧的 page_table_ 映射
-    page_table_.erase(frame->page_id_);
-
-    // 建立新的 page_table_ 映射
-    // auto frame
-    frame->Reset();
-    frame->page_id_ = page_id;
-    page_table_[page_id] = frame_id;
-
-    frame->pin_count_.store(1);
-    replacer_->RecordAccess(frame_id, page_id, access_type);
-    replacer_->SetEvictable(frame_id, false);
-
-    bpm_latch_->unlock();
-    // 从磁盘读入页面数据
     auto promise = disk_scheduler_->CreatePromise();
     auto future = promise.get_future();
+
     std::vector<DiskRequest> requests;
-    requests.push_back({false, frame->GetDataMut(), page_id, std::move(promise)});
+    requests.push_back({true, frame->GetDataMut(), old_page_id, std::move(promise)});
 
     disk_scheduler_->Schedule(requests);
-    future.get(); // 等待读完成
+    future.get(); // 等待写完成
 
-    return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+    bpm_latch_->lock(); // 这里需要重新拿锁
   }
+  // 删除旧的 page_table_ 映射
+  page_table_.erase(frame->page_id_);
+
+  // 建立新的 page_table_ 映射
+  // auto frame
+  frame->Reset();
+  frame->page_id_ = page_id;
+  page_table_[page_id] = frame_id;
+
+  frame->pin_count_.store(1);
+  replacer_->RecordAccess(frame_id, page_id, access_type);
+  replacer_->SetEvictable(frame_id, false);
+
+  bpm_latch_->unlock();
+  // 从磁盘读入页面数据
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  std::vector<DiskRequest> requests;
+  requests.push_back({false, frame->GetDataMut(), page_id, std::move(promise)});
+
+  disk_scheduler_->Schedule(requests);
+  future.get(); // 等待读完成
+
+  return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+  // }
 
   // bpm_latch_->unlock();
 }
@@ -546,7 +547,7 @@ auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
   // std::lock_guard<std::mutex> lk(*bpm_latch_);
   auto it = page_table_.find(page_id);
-  if(it == page_table_.end() ) return false;
+  if(it == page_table_.end() ) { return false; }
 
   auto frame = frames_[it->second];
   if(frame->is_dirty_) {
@@ -585,7 +586,7 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
   std::lock_guard<std::mutex> lk(*bpm_latch_);
   auto it = page_table_.find(page_id);
-  if(it == page_table_.end() ) return false;
+  if(it == page_table_.end() ) { return false; }
 
   auto frame = frames_[it->second];
   if(frame->is_dirty_) {
