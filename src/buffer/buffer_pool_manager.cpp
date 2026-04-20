@@ -232,7 +232,10 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   // 这里分为三种情况
 
   // 先加个锁
-  bpm_latch_->lock();
+  // bpm_latch_->lock();
+  // 手动解锁一次，如果用 lockguard 上锁，会导致 lock_guard 析构时也会再解锁一次，属于未定义的行为
+  // std::lock_guard<std::mutex> lk(*bpm_latch_); 这个不能中途解锁
+  std::unique_lock<std::mutex> lk(*bpm_latch_);
 
   auto table_node = page_table_.find(page_id);
   if(table_node != page_table_.end()) {
@@ -241,10 +244,11 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     auto frame = frames_[frame_id];
     frame->page_id_ = page_id;
     frame->pin_count_.fetch_add(1);
-    replacer_->SetEvictable(frame_id, false);
     replacer_->RecordAccess(frame_id, page_id, access_type);
+    replacer_->SetEvictable(frame_id, false);
 
-    bpm_latch_->unlock();
+    // bpm_latch_->unlock();
+    lk.unlock();
     // 构造并返回 guard ()， WritePageGuard 构造函数内部会对 frame->rwlatch_ 加写锁
     // Guard 内部存的 bpm_latch_ 和 BPM 里的 bpm_latch_ 指向的是同一个 std::mutex 对象，只是引用计数加了1
     return WritePageGuard(page_id, frames_[frame_id], replacer_, bpm_latch_, disk_scheduler_);
@@ -262,10 +266,11 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     frame->page_id_ = page_id;
     page_table_[page_id] = frame_id; // 建立起新的映射
     frame->pin_count_.store(1);
-    replacer_->SetEvictable(frame_id, false);
     replacer_->RecordAccess(frame_id, page_id, access_type);
+    replacer_->SetEvictable(frame_id, false);
 
-    bpm_latch_->unlock(); // 释放锁，再做磁盘 IO
+    // bpm_latch_->unlock(); // 释放锁，再做磁盘 IO
+    lk.unlock();
     // 发起磁盘读请求，从磁盘读入页面数据
     auto promise = disk_scheduler_->CreatePromise(); // pomise 是后台线程做完某件事情后，通知前台线程的工具
     auto future = promise.get_future();
@@ -296,7 +301,8 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     auto old_page_id = frame->page_id_;
 
     frame->is_dirty_ = false; // 先清标记，防止并发重复写
-    bpm_latch_->unlock(); // 释放锁再做 IO
+    // bpm_latch_->unlock(); // 释放锁再做 IO
+    lk.unlock();
 
     auto promise = disk_scheduler_->CreatePromise();
     auto future = promise.get_future();
@@ -307,7 +313,8 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     disk_scheduler_->Schedule(requests);
     future.get(); // 等待写完成
 
-    bpm_latch_->lock(); // 这里需要重新拿锁
+    // bpm_latch_->lock(); // 这里需要重新拿锁
+    lk.lock();
   }
   // 删除旧的 page_table_ 映射
   page_table_.erase(frame->page_id_);
@@ -322,7 +329,8 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   replacer_->RecordAccess(frame_id, page_id, access_type);
   replacer_->SetEvictable(frame_id, false);
 
-  bpm_latch_->unlock();
+  // bpm_latch_->unlock();
+  lk.unlock();
   // 从磁盘读入页面数据
   auto promise = disk_scheduler_->CreatePromise();
   auto future = promise.get_future();
@@ -367,7 +375,8 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
   // 这里分为三种情况
 
   // 先加个锁
-  bpm_latch_->lock();
+  // bpm_latch_->lock();
+  std::unique_lock<std::mutex> lk(*bpm_latch_);
 
   auto table_node = page_table_.find(page_id);
   if(table_node != page_table_.end()) {
@@ -376,10 +385,11 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
     auto frame = frames_[frame_id];
     frame->page_id_ = page_id;
     frame->pin_count_.fetch_add(1);
-    replacer_->SetEvictable(frame_id, false);
     replacer_->RecordAccess(frame_id, page_id, access_type);
+    replacer_->SetEvictable(frame_id, false);
 
-    bpm_latch_->unlock();
+    // bpm_latch_->unlock();
+    lk.unlock();
     // 构造并返回 guard ()， WritePageGuard 构造函数内部会对 frame->rwlatch_ 加写锁
     // Guard 内部存的 bpm_latch_ 和 BPM 里的 bpm_latch_ 指向的是同一个 std::mutex 对象，只是引用计数加了1
     return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
@@ -397,10 +407,11 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
     frame->page_id_ = page_id;
     page_table_[page_id] = frame_id; // 建立起新的映射
     frame->pin_count_.store(1);
-    replacer_->SetEvictable(frame_id, false);
     replacer_->RecordAccess(frame_id, page_id, access_type);
+    replacer_->SetEvictable(frame_id, false);
 
-    bpm_latch_->unlock(); // 释放锁，再做磁盘 IO
+    // bpm_latch_->unlock(); // 释放锁，再做磁盘 IO
+    lk.unlock();
     // 发起磁盘读请求，从磁盘读入页面数据
     auto promise = disk_scheduler_->CreatePromise(); // pomise 是后台线程做完某件事情后，通知前台线程的工具
     auto future = promise.get_future();
@@ -431,7 +442,8 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
     auto old_page_id = frame->page_id_;
 
     frame->is_dirty_ = false; // 先清标记，防止并发重复写
-    bpm_latch_->unlock(); // 释放锁再做 IO
+    // bpm_latch_->unlock(); // 释放锁再做 IO
+    lk.unlock();
 
     auto promise = disk_scheduler_->CreatePromise();
     auto future = promise.get_future();
@@ -442,7 +454,8 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
     disk_scheduler_->Schedule(requests);
     future.get(); // 等待写完成
 
-    bpm_latch_->lock(); // 这里需要重新拿锁
+    // bpm_latch_->lock(); // 这里需要重新拿锁
+    lk.lock();
   }
   // 删除旧的 page_table_ 映射
   page_table_.erase(frame->page_id_);
@@ -457,7 +470,8 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
   replacer_->RecordAccess(frame_id, page_id, access_type);
   replacer_->SetEvictable(frame_id, false);
 
-  bpm_latch_->unlock();
+  // bpm_latch_->unlock();
+  lk.unlock();
   // 从磁盘读入页面数据
   auto promise = disk_scheduler_->CreatePromise();
   auto future = promise.get_future();

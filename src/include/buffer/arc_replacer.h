@@ -86,6 +86,7 @@ class ArcReplacer {
   std::mutex latch_;
 
   // TODO(student): You can add member variables / functions as you like.
+  // std::mutex latch_;
 
   void Dieout(std::unordered_map<frame_id_t, std::shared_ptr<FrameStatus>>::const_iterator it, std::list<frame_id_t>&list_, std::list<page_id_t>&list_ghost_);
 };

@@ -48,6 +48,7 @@ ArcReplacer::ArcReplacer(size_t num_frames) : replacer_size_(num_frames) {}
  * @return frame id of the evicted frame, or std::nullopt if cannot evict
  */
 auto ArcReplacer::Evict() -> std::optional<frame_id_t> {
+	std::lock_guard<std::mutex> lk(latch_);
 	// 这里实现的是 ARC 的 REPLACE 操作
 	// 从 mru_ 或者 mfu_ 中找到一个 evictable 的 frame 淘汰出去，并把它移入到对应的 ghost list
 	if(mru_.size() >= mru_target_size_) {
@@ -85,41 +86,41 @@ auto ArcReplacer::Evict() -> std::optional<frame_id_t> {
 		// 到这里说明两侧都被 pin 住
 		return std::nullopt;
 	}
-	else {
-		// 从 mfu_ 尾部找 evictable frame 淘汰 → 移入 mfu_ghost_ 头部
-		auto rit = mfu_.rbegin();
-		for(; rit!= mfu_.rend(); ++rit) {
-			// 这个 mfu 链表里存的是 frameid
-			auto node = alive_map_.find(*rit);
+	// else {
+	// 从 mfu_ 尾部找 evictable frame 淘汰 → 移入 mfu_ghost_ 头部
+	auto rit = mfu_.rbegin();
+	for(; rit!= mfu_.rend(); ++rit) {
+		// 这个 mfu 链表里存的是 frameid
+		auto node = alive_map_.find(*rit);
+		if(node->second->evictable_) {
+			// 找到尾部方向上的一个可淘汰的节点
+			// 执行淘汰
+			frame_id_t result = *rit;
+			Dieout(node, mfu_, mfu_ghost_);
+			return result;
+
+			// break;
+		}
+	}
+	if(rit == mfu_.rend()) {
+		// 说明整个 mfu_ 都没有 evictable，那么转向到另一侧尝试淘汰，移入对应那侧的 ghost list
+		auto rrit = mru_.rbegin();
+		for(; rrit != mru_.rend(); ++rrit) {
+			auto node = alive_map_.find(*rrit);
 			if(node->second->evictable_) {
-				// 找到尾部方向上的一个可淘汰的节点
+				// 在另一侧找到可淘汰的节点
 				// 执行淘汰
-				frame_id_t result = *rit;
-				Dieout(node, mfu_, mfu_ghost_);
+				frame_id_t result = *rrit;
+				Dieout(node, mru_, mru_ghost_);
 				return result;
 
 				// break;
 			}
 		}
-		if(rit == mfu_.rend()) {
-			// 说明整个 mfu_ 都没有 evictable，那么转向到另一侧尝试淘汰，移入对应那侧的 ghost list
-			auto rrit = mru_.rbegin();
-			for(; rrit != mru_.rend(); ++rrit) {
-				auto node = alive_map_.find(*rrit);
-				if(node->second->evictable_) {
-					// 在另一侧找到可淘汰的节点
-					// 执行淘汰
-					frame_id_t result = *rrit;
-					Dieout(node, mru_, mru_ghost_);
-					return result;
-
-					// break;
-				}
-			}
-		}
-		// 到这里说明两侧都被 pin 住了
-		return std::nullopt;
 	}
+	// 到这里说明两侧都被 pin 住了
+	return std::nullopt;
+	// }
 
 
 	// 如果两侧都全部 pinned，返回 std::nullopt
@@ -193,6 +194,7 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
 		在 ARC 里，一个页可能处于四种状态。
 		这个函数的任务是根据这个 frame_id 当前所处的位置，做一次状态转移
 	*/
+	std::lock_guard<std::mutex> lk(latch_);
 	// unordered_map 是一个键值对容器，底层通常基于哈希表实现
 	auto it = alive_map_.find(frame_id);
 	if(it != alive_map_.end()) {
@@ -297,6 +299,7 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
  * @param set_evictable whether the given frame is evictable or not
  */
 void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
+	std::lock_guard<std::mutex> lk(latch_);
 	// 设置可淘汰状态
 	// 在 alive_map_ 中查找 frame_id ，找不到则说明 frame_id 无效
 	auto it = alive_map_.find(frame_id);
@@ -337,12 +340,13 @@ void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
  * @param frame_id id of frame to be removed
  */
 void ArcReplacer::Remove(frame_id_t frame_id) {
+	std::lock_guard<std::mutex> lk(latch_);
 	// 强制移除指定 frame
 	auto it = alive_map_.find(frame_id);
 	if (it == alive_map_.end()) {
 		return ;
 	}
-	if(it->second->evictable_ == false) {
+	if(!it->second->evictable_) {
 		throw Exception("Remove: this frame is non-evictable");
 	}
 

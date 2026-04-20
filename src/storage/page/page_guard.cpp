@@ -100,7 +100,7 @@ ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {
  * @return ReadPageGuard& The newly valid `ReadPageGuard`.
  */
 auto ReadPageGuard::operator=(ReadPageGuard &&that) noexcept -> ReadPageGuard & {
-  if(this == &that) return *this;
+  if(this == &that) { return *this; }
 
   Drop();
 
@@ -268,7 +268,7 @@ WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {
  * @return WritePageGuard& The newly valid `WritePageGuard`.
  */
 auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard & {
-  if(this == &that) return *this;
+  if(this == &that) { return *this; }
 
   Drop();
 
@@ -307,6 +307,7 @@ auto WritePageGuard::GetData() const -> const char * {
  */
 auto WritePageGuard::GetDataMut() -> char * {
   BUSTUB_ENSURE(is_valid_, "tried to use an invalid write guard");
+  frame_->is_dirty_ = true; // 只要调用了 GetDataMut 就说明页面被修改了，设置脏页标记
   return frame_->GetDataMut();
 }
 
@@ -328,7 +329,7 @@ void WritePageGuard::Flush() {
   // 将脏页写回磁盘，需要用 disk_scheduler_ 发起一个写请求：
   // WritePageGuard 持有独占写锁，有完整的写权限，flush 之后可以安全地把 is_dirty_ 置为false，因为此时没有其他线程能修改这个页面。
   // std::lock_guard<std::mutex> lk(*bpm_latch_);
-  if(!is_valid_ || !frame_->is_dirty_) return ;
+  if(!is_valid_ || !frame_->is_dirty_)  {return ; }
   frame_->is_dirty_ = false;
 
   auto promise = disk_scheduler_->CreatePromise();
