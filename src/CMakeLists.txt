@@ -35,12 +35,19 @@ set(BUSTUB_LIBS
 
 find_package(Threads REQUIRED)
 
+# libnuma for NUMA-aware buffer pool manager
+find_library(NUMA_LIB numa)
+if(NOT NUMA_LIB)
+        message(FATAL_ERROR "libnuma not found. Install libnuma-dev (apt) or numactl-devel (yum).")
+endif()
+
 set(BUSTUB_THIRDPARTY_LIBS
         bustub_murmur3
         duckdb_pg_query
         fmt
         libfort::fort
         Threads::Threads
+        ${NUMA_LIB}
         )
 
 target_link_libraries(

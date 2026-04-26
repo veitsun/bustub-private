@@ -24,6 +24,7 @@
 namespace bustub {
 
 class BufferPoolManager;
+class NumaBufferPoolManager;
 class FrameHeader;
 
 /**
@@ -38,6 +39,7 @@ class FrameHeader;
 class ReadPageGuard {
   /** @brief Only the buffer pool manager is allowed to construct a valid `ReadPageGuard.` */
   friend class BufferPoolManager;
+  friend class NumaBufferPoolManager;
 
  public:
   /**
@@ -142,6 +144,7 @@ class ReadPageGuard {
 class WritePageGuard {
   /** @brief Only the buffer pool manager is allowed to construct a valid `WritePageGuard.` */
   friend class BufferPoolManager;
+  friend class NumaBufferPoolManager;
 
  public:
   /**
