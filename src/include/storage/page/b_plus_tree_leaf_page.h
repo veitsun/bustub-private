@@ -73,6 +73,7 @@ class BPlusTreeLeafPage : public BPlusTreePage {
   auto GetNextPageId() const -> page_id_t;
   void SetNextPageId(page_id_t next_page_id);
   auto KeyAt(int index) const -> KeyType;
+  auto ValueAt(int index) const -> ValueType;
 
   /**
    * @brief for test only return a string representing all keys in
@@ -109,9 +110,13 @@ class BPlusTreeLeafPage : public BPlusTreePage {
     return kstr;
   }
 
+  // 做一个插入的辅助函数
+  void SetKeyValueAt(int index, const KeyType &key,  const ValueType &value);
+
+
  private:
-  page_id_t next_page_id_;
-  size_t num_tombstones_;
+  page_id_t next_page_id_;  // 把所有叶子串成链表，便于范围查询
+  size_t num_tombstones_;   // 作用是延迟删除，记录“哪些位置逻辑上已经删了”
   // Fixed-size tombstone buffer (indexes into key_array_ / rid_array_).
   size_t tombstones_[LEAF_PAGE_TOMB_CNT];
   // Array members for page data.

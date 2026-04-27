@@ -88,6 +88,9 @@ class BPlusTree {
   // Insert a key-value pair into this B+ tree.
   auto Insert(const KeyType &key, const ValueType &value) -> bool;
 
+  // 插入父节点，父节点也有可能需要分裂
+  
+
   // Remove a key and its value from this B+ tree.
   void Remove(const KeyType &key);
 
@@ -128,13 +131,15 @@ class BPlusTree {
 
   auto ToPrintableBPlusTree(page_id_t root_id) -> PrintableBPlusTree;
 
+  // auto LookUpLeafPage(page_id_t page_id, Context &ctx) -> BPlusTreeLeafPage<KeyType, ValueType, KeyComparator>&;
+
   // member variable
-  std::string index_name_;
-  KeyComparator comparator_;
-  std::vector<std::string> log;  // NOLINT
-  int leaf_max_size_;
-  int internal_max_size_;
-  page_id_t header_page_id_;
+  std::string index_name_;      // 这个索引的名字
+  KeyComparator comparator_;    // 比较器，key 的大小比较规则，查找时决定往哪个child走
+  std::vector<std::string> log;  // NOLINT 预留的调试日志容器
+  int leaf_max_size_;            // 表示叶子页最多能放多少个 kv 对
+  int internal_max_size_;        // 内部页最多能放多少个子指针/槽位
+  page_id_t header_page_id_;     // 里面有当前最新的 root page id 的信息，固定索引入口
 };
 
 /**

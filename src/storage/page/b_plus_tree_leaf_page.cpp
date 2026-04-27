@@ -32,7 +32,19 @@ namespace bustub {
  * @param max_size Max size of the leaf node
  */
 FULL_INDEX_TEMPLATE_ARGUMENTS
-void B_PLUS_TREE_LEAF_PAGE_TYPE::Init(int max_size) { UNIMPLEMENTED("TODO(P2): Add implementation."); }
+void B_PLUS_TREE_LEAF_PAGE_TYPE::Init(int max_size) {
+  // UNIMPLEMENTED("TODO(P2): Add implementation."); 
+  // 将页面设置为 leaf page
+  this->SetPageType(IndexPageType::LEAF_PAGE);
+  // 设置当前 size 为 0
+  this->SetSize(0);
+  // 设置 max size
+  this->SetMaxSize(max_size);
+  // 设置 next_page_id_ 为 INVALID_PAGE_ID
+  this->SetNextPageId(INVALID_PAGE_ID);
+  // 初始化 num_tombstones_ 为 0
+  this->num_tombstones_ = 0;
+}
 
 /**
  * @brief Helper function for fetching tombstones of a page.
@@ -40,18 +52,30 @@ void B_PLUS_TREE_LEAF_PAGE_TYPE::Init(int max_size) { UNIMPLEMENTED("TODO(P2): A
  */
 FULL_INDEX_TEMPLATE_ARGUMENTS
 auto B_PLUS_TREE_LEAF_PAGE_TYPE::GetTombstones() const -> std::vector<KeyType> {
-  UNIMPLEMENTED("TODO(P2): Add implementation.");
+  std::vector<KeyType> tombstone_keys;
+  tombstone_keys.reserve(num_tombstones_);
+
+  for (size_t i = 0; i < num_tombstones_; i++) {
+    BUSTUB_ASSERT(static_cast<int>(tombstones_[i]) < GetSize(), "tombstone index out of range");
+    tombstone_keys.push_back(key_array_[tombstones_[i]]);
+  }
+
+  return tombstone_keys;
 }
 
 /**
  * Helper methods to set/get next page id
  */
 FULL_INDEX_TEMPLATE_ARGUMENTS
-auto B_PLUS_TREE_LEAF_PAGE_TYPE::GetNextPageId() const -> page_id_t { UNIMPLEMENTED("TODO(P2): Add implementation."); }
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::GetNextPageId() const -> page_id_t {
+  // UNIMPLEMENTED("TODO(P2): Add implementation."); 
+  return next_page_id_;
+}
 
 FULL_INDEX_TEMPLATE_ARGUMENTS
 void B_PLUS_TREE_LEAF_PAGE_TYPE::SetNextPageId(page_id_t next_page_id) {
-  UNIMPLEMENTED("TODO(P2): Add implementation.");
+  // UNIMPLEMENTED("TODO(P2): Add implementation.");
+  next_page_id_ = next_page_id;
 }
 
 /*
@@ -59,7 +83,21 @@ void B_PLUS_TREE_LEAF_PAGE_TYPE::SetNextPageId(page_id_t next_page_id) {
  * array offset)
  */
 FULL_INDEX_TEMPLATE_ARGUMENTS
-auto B_PLUS_TREE_LEAF_PAGE_TYPE::KeyAt(int index) const -> KeyType { UNIMPLEMENTED("TODO(P2): Add implementation."); }
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::KeyAt(int index) const -> KeyType {
+  // UNIMPLEMENTED("TODO(P2): Add implementation.");
+  return key_array_[index];
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::ValueAt(int index) const -> ValueType {
+  return rid_array_[index];
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_LEAF_PAGE_TYPE::SetKeyValueAt(int index, const KeyType &key,  const ValueType &value) {
+  key_array_[index] = key;
+  rid_array_[index] = value;
+}
 
 template class BPlusTreeLeafPage<GenericKey<4>, RID, GenericComparator<4>>;
 

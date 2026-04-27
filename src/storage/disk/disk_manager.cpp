@@ -90,15 +90,15 @@ void DiskManager::WritePage(page_id_t page_id, const char *page_data) {
   }
 
   // Set the write cursor to the page offset.
-  db_io_.seekp(offset);
-  db_io_.write(page_data, BUSTUB_PAGE_SIZE);
+  db_io_.seekp(offset);   // 把文件写指针移到对应位置
+  db_io_.write(page_data, BUSTUB_PAGE_SIZE);  // 把整页字节写入
   if (db_io_.bad()) {
     LOG_DEBUG("I/O error while writing page %d", page_id);
     return;
   }
 
   num_writes_ += 1;
-  pages_[page_id] = offset;
+  pages_[page_id] = offset; // 更新偏移
 
   // Flush the write to disk.
   db_io_.flush();
