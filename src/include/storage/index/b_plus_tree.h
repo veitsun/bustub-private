@@ -89,7 +89,7 @@ class BPlusTree {
   auto Insert(const KeyType &key, const ValueType &value) -> bool;
 
   // 插入父节点，父节点也有可能需要分裂
-  
+  void InsertIntoParent(page_id_t old_page_id, const KeyType &push_up_key, page_id_t new_page_id, Context &ctx);
 
   // Remove a key and its value from this B+ tree.
   void Remove(const KeyType &key);

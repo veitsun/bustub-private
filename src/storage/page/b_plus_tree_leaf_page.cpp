@@ -94,6 +94,15 @@ auto B_PLUS_TREE_LEAF_PAGE_TYPE::ValueAt(int index) const -> ValueType {
 }
 
 FULL_INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_LEAF_PAGE_TYPE::RemoveAt(int index) {
+  for(int i = index; i < GetSize() - 1; i ++) {
+    key_array_[i] = key_array_[i + 1];
+    rid_array_[i] = rid_array_[i + 1];
+  }
+  ChangeSizeBy(-1);
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
 void B_PLUS_TREE_LEAF_PAGE_TYPE::SetKeyValueAt(int index, const KeyType &key,  const ValueType &value) {
   key_array_[index] = key;
   rid_array_[index] = value;

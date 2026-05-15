@@ -14,6 +14,7 @@
 #include <sstream>
 
 #include "common/exception.h"
+#include "common/rid.h"
 #include "storage/page/b_plus_tree_internal_page.h"
 
 namespace bustub {
@@ -63,6 +64,16 @@ void B_PLUS_TREE_INTERNAL_PAGE_TYPE::SetKeyAt(int index, const KeyType &key) {
   key_array_[index] = key;
 }
 
+INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_INTERNAL_PAGE_TYPE::ValueIndex(const ValueType &value) const -> int {
+  for (int i = 0; i < GetSize(); i++) {
+    if (page_id_array_[i] == value) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 /**
  * @brief Helper method to get the value associated with input "index"(a.k.a array
  * offset)
@@ -74,6 +85,21 @@ INDEX_TEMPLATE_ARGUMENTS
 auto B_PLUS_TREE_INTERNAL_PAGE_TYPE::ValueAt(int index) const -> ValueType {
   // UNIMPLEMENTED("TODO(P2): Add implementation.");
   return page_id_array_[index];
+}
+
+INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_INTERNAL_PAGE_TYPE::SetValueAt(int index, const ValueType &value) {
+  // key_array_[index] = key;
+  page_id_array_[index] = value;
+}
+
+INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_INTERNAL_PAGE_TYPE::RemoveAt(int index) {
+  for(int i = index; i < GetSize() - 1; i ++) {
+    key_array_[i] = key_array_[i + 1];
+    page_id_array_[i] = page_id_array_[i + 1];
+  }
+  ChangeSizeBy(-1);
 }
 
 // valuetype for internalNode should be page id_t
