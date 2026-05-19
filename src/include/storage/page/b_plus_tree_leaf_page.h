@@ -76,6 +76,9 @@ class BPlusTreeLeafPage : public BPlusTreePage {
   auto ValueAt(int index) const -> ValueType;
   void RemoveAt(int index);
 
+  auto KeyAtRef(int index) const -> const KeyType &;
+  auto ValueAtRef(int index) const -> const ValueType &;
+
   /**
    * @brief for test only return a string representing all keys in
    * this leaf page formatted as "(tombkey1, tombkey2, ...|key1,key2,key3,...)"
