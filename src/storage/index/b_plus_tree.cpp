@@ -15,6 +15,7 @@
 #include <vector>
 #include "buffer/traced_buffer_pool_manager.h"
 #include "common/config.h"
+#include "common/macros.h"
 #include "storage/index/b_plus_tree_debug.h"
 #include "storage/index/index_iterator.h"
 #include "storage/page/b_plus_tree_header_page.h"
@@ -621,6 +622,7 @@ void BPLUSTREE_TYPE::InsertIntoParent(page_id_t old_page_id, const KeyType &push
  */
 FULL_INDEX_TEMPLATE_ARGUMENTS
 void BPLUSTREE_TYPE::Remove(const KeyType &key) {
+  // 这次删除按设计不需要借位，不需要合并，不需要改父节点，更不需要改 header。因此正确的实现下，只有目标叶子需要写一次
   // Declaration of context instance.
   Context ctx;
   // UNIMPLEMENTED("TODO(P2): Add implementation.");
@@ -709,6 +711,9 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
   if(ctx.write_set_.empty()) {
     if(leaf->GetSize() == 0) {
       ctx.header_page_->AsMut<BPlusTreeHeaderPage>()->root_page_id_ = INVALID_PAGE_ID;
+      leaf_guard.Drop();
+      auto ok = bpm_->DeletePage(leaf_page_id);
+      BUSTUB_ASSERT(ok, "failed to delete empty root leaf");
     }
     return ;
   }
@@ -731,7 +736,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
     if(left_sib->GetSize() > leaf_min) {
       // 把左兄弟的最后一个 kv 移到当前叶子的最前面
       int last = left_sib->GetSize() - 1;
-      for(int i = leaf->GetSize() - 1; i > 0 ; i --) {
+      for(int i = leaf->GetSize(); i > 0 ; i --) {
         leaf->SetKeyValueAt(i, leaf->KeyAt(i - 1), leaf->ValueAt(i  - 1));
       }
       leaf->SetKeyValueAt(0, left_sib->KeyAt(last), left_sib->ValueAt(last));
@@ -750,7 +755,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
       // 把右兄弟第一个 kv 移到当前叶子的后面
       leaf->SetKeyValueAt(leaf->GetSize(), right_sib->KeyAt(0), right_sib->ValueAt(0));
       leaf->ChangeSizeBy(1);
-      right_sib->ChangeSizeBy(-1);
+      // right_sib->ChangeSizeBy(-1);
       right_sib->RemoveAt(0);
       parent->SetKeyAt(idx + 1, right_sib->KeyAt(0));
       return ;
@@ -772,27 +777,41 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
 
     // 从父节点删除 idx 处 的 key 和 value （即  leaf_page_id 对应的槽）
     parent->RemoveAt(idx);
+    leaf_guard.Drop();
+    auto ok = bpm_->DeletePage(leaf_page_id);
+    BUSTUB_ASSERT(ok, "failed to delete merged leaf");
   }
   else{
-    // 与右兄弟合并（把右兄弟合并进当前叶子）
-    auto right_guard = bpm_->WritePage(parent->ValueAt(idx + 1));
-    auto right_sib = right_guard.template AsMut<LeafPage>();
-    for(int i = 0; i < right_sib->GetSize(); i ++) {
-      leaf->SetKeyValueAt(leaf->GetSize() + i, right_sib->KeyAt(i), right_sib->ValueAt(i));
 
+    // 这里被删除的是右兄弟，不是当前叶子，先记住页号，再删
+    page_id_t right_page_id = parent->ValueAt(idx + 1);
+    {
+      // 与右兄弟合并（把右兄弟合并进当前叶子）
+      auto right_guard = bpm_->WritePage(right_page_id);
+      auto right_sib = right_guard.template AsMut<LeafPage>();
+
+      for(int i = 0; i < right_sib->GetSize(); i ++) {
+        leaf->SetKeyValueAt(leaf->GetSize() + i, right_sib->KeyAt(i), right_sib->ValueAt(i));
+      }
       leaf->ChangeSizeBy(right_sib->GetSize());
-
       leaf->SetNextPageId(right_sib->GetNextPageId());
-
       parent->RemoveAt(idx + 1);
+      right_guard.Drop();
     }
+    auto ok = bpm_->DeletePage(right_page_id);
+    BUSTUB_ASSERT(ok, "failed to delete merged right leaf");
+
   }
 
 
   // 父节点也可能是 underflow, 递归向上处理
   int internal_min = (internal_max_size_ + 1) / 2;
-  page_id_t child_id  = parent_guard.GetPageId();
+  // page_id_t child_id  = parent_guard.GetPageId();
+  // 当前正在处理的 internal page 不能只留裸指针，要让 guard 持有它
+  WritePageGuard current_guard = std::move(ctx.write_set_.back());
   ctx.write_set_.pop_back();
+  page_id_t child_id = current_guard.GetPageId();
+  parent = current_guard.AsMut<InternalPage>();
 
   while(parent->GetSize() < internal_min && !ctx.write_set_.empty()) {
     auto &grand_guard = ctx.write_set_.back();
@@ -841,6 +860,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
 
     // 合并 Internal page
     if(pidx > 0) {
+      // 当前 parent 合并进左兄弟，所以被删除的是 current_guard 持有的页
       auto ls_guard = bpm_ -> WritePage(grand->ValueAt(pidx - 1));
       auto ls = ls_guard.template AsMut<InternalPage>();
       // 把 grand 的分隔 key 下推，再把 parent 的内容追加到 ls
@@ -854,9 +874,15 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
         ls->ChangeSizeBy(1);
       }
       grand->RemoveAt(pidx);
+
+      current_guard.Drop();
+      auto ok = bpm_->DeletePage(child_id);
+      BUSTUB_ASSERT(ok, "failed to delete merged internal page");
     }
     else {
-      auto rs_guard = bpm_ -> WritePage(grand->ValueAt(pidx + 1));
+      // 右兄弟合并进当前 parent， 所以被删除的是右兄弟
+      page_id_t right_page_id = grand->ValueAt(pidx + 1);
+      auto rs_guard = bpm_ -> WritePage(right_page_id);
       auto rs = rs_guard.template AsMut<InternalPage>();
       parent->SetKeyAt(parent->GetSize(), grand->KeyAt(pidx + 1));
       parent->SetValueAt(parent->GetSize(), rs->ValueAt(0));
@@ -869,19 +895,28 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
         parent->ChangeSizeBy(1);
       }
       grand->RemoveAt(pidx + 1);
+
+      rs_guard.Drop();
+      auto ok = bpm_->DeletePage(right_page_id);
+      BUSTUB_ASSERT(ok, "failed to delete merged right internal page");
     }
 
     child_id = grand_guard.GetPageId();
-    parent = grand;
+    current_guard = std::move(grand_guard);
     ctx.write_set_.pop_back();
+    parent = current_guard.AsMut<InternalPage>();
 
 
   }
 
   // 如果根节点只剩一个 child， 收缩树高
   if(ctx.write_set_.empty() && parent->GetSize() == 1) {
+    page_id_t old_root_page_id = current_guard.GetPageId();
     ctx.header_page_ -> AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = parent->ValueAt(0);
     ctx.root_page_id_ = parent->ValueAt(0);
+    current_guard.Drop();
+    auto ok = bpm_->DeletePage(old_root_page_id);
+    BUSTUB_ASSERT(ok, "failed to delete shrunk root internal page");
   }
 
 
