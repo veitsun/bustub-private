@@ -135,9 +135,20 @@ class BPlusTree {
 
   // auto LookUpLeafPage(page_id_t page_id, Context &ctx) -> BPlusTreeLeafPage<KeyType, ValueType, KeyComparator>&;
 
-  // 在叶子页内二分查找 key。命中返回其下标，未命中返回 -1。
+  // 在叶子页内二分查找key。命中返回其下标，未命中返回 -1。
   // insert_pos 输出「若要插入该key，应该放在哪个下标」（命中时等于命中下标）。
   auto FindKeyInLeaf(const LeafPage *leaf, const KeyType &key, int *insert_pos) const -> int;
+
+  // 内部页二分：返回应当下降到的 child 槽位。
+  // 约定 KeyAt(0) 无效（有效 key 从 1 开始），ValueAt(0) 是最左孩子（合法默认值）。
+  auto ChildIndex(const InternalPage *internal, const KeyType &key) const -> int;
+
+  // 乐观路径专用的「螃蟹式下降」（latch crabbing）：
+  // 全程只加读锁，且始终先锁住孩子再放开父亲，到达叶子时把它升级成写锁。
+  // 返回叶子的写 guard；树为空时返回std::nullopt。
+  // leaf_page_id / leaf_is_root 为输出参数。
+  auto CrabDownToLeaf(const KeyType &key, page_id_t *leaf_page_id, bool *leaf_is_root)
+      -> std::optional<WritePageGuard>;
 
   // 合并两页之后 tombstone 可能超出固定容量。按FIFO 从最老的开始物理删除对应 entry，
   // 直到剩余数量能装进tombstone 缓冲区，最后把结果写回页面。

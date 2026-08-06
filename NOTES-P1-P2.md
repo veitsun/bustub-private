@@ -4,6 +4,10 @@
 > 涉及文件、设计思路、关键实现细节、以及遗留缺口与已知风险。
 >
 > 代码基线：`master`，`src/` 目录。
+> 测试状态：**P1 16/16、P2 18/18 全部通过**（ASan 开启）。
+>
+> ⚠️ 文中带「最初写错了 / 已修复」标注的段落是**刻意保留**的：
+> 那些结论在第一版笔记里是反的，被并发测试打脸后才纠正。保留错误路径比只留正确答案更有价值。
 
 ---
 
@@ -20,11 +24,14 @@
 - [Project 2 — B+Tree Index](#project-2--btree-index)
   - [2.1 整体架构](#21-整体架构)
   - [2.2 页面层辅助方法](#22-页面层辅助方法)
-  - [2.3 查找 GetValue](#23-查找-getvalue)
+  - [2.3 查找 GetValue（含latch crabbing）](#23-查找-getvalue)
   - [2.4 插入 Insert 与 InsertIntoParent](#24-插入-insert-与-insertintoparent)
+    - [CrabDownToLeaf 与 protector 角色](#crabdowntoleaf乐观路径的公共下降逻辑)
+    - [★ 乐观 vs悲观：protector 与 write_set_ 的分工](#乐观-vs-悲观protector-与-ctxwrite_set_-的分工)
   - [2.5 删除 Remove](#25-删除-remove)
-  - [2.6 迭代器 IndexIterator](#26-迭代器-indexiterator)
-  - [2.7 P2 遗留缺口与风险](#27-p2-遗留缺口与风险)
+  - [2.6 迭代器 IndexIterator](#26迭代器-indexiterator)
+  - [2.7 Tombstone 懒删除](#27-tombstone-懒删除)
+  - [2.8 P2 遗留缺口与风险](#28-p2-遗留缺口与风险)
 - [附：文件改动清单](#附文件改动清单)
 
 ---
@@ -249,21 +256,37 @@ void Drop() {
   if (!is_valid_) { return; }     // 防 double free
   is_valid_ = false;
 
-  page_lock_.unlock();            // ① 先放页面锁
-
   {
-    std::lock_guard<std::mutex> lk(*bpm_latch_);   // ② 再拿 bpm_latch_
-    frame_->pin_count_--;
+    std::lock_guard<std::mutex> lk(*bpm_latch_);   // ① 先拿bpm_latch_
+    frame_->pin_count_--;                          // ② 归还 pin
     if (frame_->pin_count_ == 0) {
       replacer_->SetEvictable(frame_->frame_id_, true);
     }
+    page_lock_.unlock();                           // ③ 最后才放页面锁
   }
 }
 ```
 
-**顺序不能反。** BPM 的 `CheckedReadPage/CheckedWritePage` 是「先持 `bpm_latch_`，再构造 guard 去拿页面锁」，如果 `Drop()` 反过来「先持 `bpm_latch_` 再放页面锁」，两条路径的加锁顺序相反 → 死锁。
+**不变式：谁拿到页面锁，谁就看到 `pin_count_` 已经是干净的。**
+
+> ⚠️ 这里最初写反了（先放页面锁、再拿 `bpm_latch_` 减 pin），当时的理由是「BPM 是先持 `bpm_latch_` 再抢页面锁，反过来会死锁」。
+> 后来被 `b_plus_tree_concurrent_test.DeleteTest1` 打脸：随机崩在
+> `BUSTUB_ASSERT(ok, "failed to delete merged leaf")`，3 次里能复现 2 次。
+>
+> 原因是旧顺序留了一个窗口：`page_lock_.unlock()` 一旦完成，别的线程立刻能抢到页面锁
+> 并认为自己独占了这一页，可此时前一个持有者还没执行减 pin，`pin_count_` 仍是 1，
+> 于是它调用 `DeletePage()` 会因`pin_count > 0` 失败。
+>
+> 那么新顺序会不会死锁？不会。BPM 里唯一「持 `bpm_latch_` 再去要页面锁」的地方是
+> `CheckedRead/WritePage` 的 Case B / Case C，而那两处的 frame 分别来自 `free_frames_`
+> 和 `Evict()`（要求 `pin_count == 0`）。配合新顺序，**`pin_count == 0` 蕴含页面锁已经放掉**，
+> 所以那里绝不会真的阻塞在页面锁上，构不成环。
+>
+> 换句话说：旧顺序不是「更安全」，只是把 bug 藏得更深。
 
 `pin_count_` 归零时才通知 replacer 该frame 变为可淘汰，这也是 `curr_size_` 保持正确的关键。
+注意 `SetEvictable(true)` 与 `page_lock_.unlock()` 之间不会被 `Evict()` 插入——
+`Evict()` 需要 `bpm_latch_`，而我们全程持有它。
 
 ### GetDataMut 与脏页标记
 
@@ -335,8 +358,7 @@ frame->page_id_ = page_id;
 page_table_[page_id] = frame_id;               // 建映射
 frame->pin_count_.store(1);
 replacer_->RecordAccess(...); replacer_->SetEvictable(frame_id, false);
-lk.unlock();                                   // 放锁再做 IO
-// 发起磁盘读，同步等完成
+// ★ 全程不放 bpm_latch_，直接做磁盘读，同步等完成
 ```
 
 **Case C —— 未命中且无空闲 frame（最复杂）**
@@ -348,9 +370,7 @@ if (!victim.has_value()) { return std::nullopt; }   // 真的 OOM
 if (frame->is_dirty_) {
   auto old_page_id = frame->page_id_;
   frame->is_dirty_ = false;   // 先清标记，避免并发重复写回
-  lk.unlock();                //↓ 放锁做写回 IO
-  ... Schedule(write) ; future.get() ...
-  lk.lock();                  //   ↑ 重新拿锁
+  ... Schedule(write old_page_id) ; future.get() ...   // ★ 不放 bpm_latch_
 }
 page_table_.erase(frame->page_id_);   // 删旧映射
 frame->Reset();
@@ -358,16 +378,36 @@ frame->page_id_ = page_id;
 page_table_[page_id] = frame_id;      // 建新映射
 frame->pin_count_.store(1);
 replacer_->RecordAccess(...); replacer_->SetEvictable(frame_id, false);
-lk.unlock();
-... Schedule(read) ; future.get() ...
+... Schedule(read page_id) ; future.get() ...        // ★ 不放 bpm_latch_
 return WritePageGuard(...);
 ```
 
-三个实现要点：
+四个实现要点：
 
-1. **锁的类型选`std::unique_lock` 而不是 `std::lock_guard`**。做 IO 前要能中途 `unlock()`，IO 后要能 `lock()` 回来，`lock_guard` 做不到（源码注释里专门写了这一点）。
+1. **锁的类型选`std::unique_lock` 而不是 `std::lock_guard`**。Case A 需要在构造 guard 之前 `unlock()`。
 2. **`SetEvictable(frame_id, false)` 要放在 `RecordAccess` 之后**。`RecordAccess` 才刚把条目插进 `alive_map_`，顺序反了会抛「frame_id not found」。
-3. 所有磁盘 IO 都在**放掉 `bpm_latch_` 之后**做，`future.get()` 同步等待。否则整个缓冲池会被一次磁盘 IO 串行化。
+3. **只有 Case A 可以放锁**。命中路径不做 IO，且必须在构造 guard 之前 `lk.unlock()`，否则捏着 `bpm_latch_` 去抢页面锁会连带堵死整个 BPM。
+4. **Case B / Case C 全程持有 `bpm_latch_`，换页 IO 也在锁内做。** 见下面的说明——这里最初为了「IO 不占锁」中途放开了锁，是一个会静默丢数据的 bug。
+
+> ⚠️ **换页竞态：本项目踩过的最隐蔽的一个坑**
+>
+> 最初 Case B / Case C 为了不让磁盘 IO 占着全局锁，在 IO 前后做了 `lk.unlock()` / `lk.lock()`。
+> 这留下两个窗口：
+>
+> **窗口1（Case C 脏页写回期间放锁）**：此时 frame 已被 `Evict()` 从 replacer 摘掉、
+> `pin_count` 是 0，但 `page_table_` 里 `old_page_id → frame_id` 的映射**还在**。
+> 别的线程请求 `old_page_id` 会命中 `page_table_`、拿到这个 frame 的 guard 并开始读写；
+> 我们回来后 `frame->Reset()` 把数据清零并换成新页，**对方的写入被静默丢弃**。
+>
+> **窗口 2（Case B / C 读入新页前放锁）**：`page_table_[page_id]` 已经装好了，
+> 但 frame 里还是旧数据 / 全零，而我们**尚未持有 `frame->rwlatch_`**（guard 是 IO 之后才构造的）。
+> 别的线程命中 `page_table_` 后能直接读到未初始化的内容。
+>
+> 症状：`b_plus_tree_concurrent_test` 的 `InsertTest2` / `MixTest1` **并发插入随机丢 key**，
+> 而单线程、以及缓冲池开大到不触发淘汰时都完全正常。定位方法见1.7 的「定位手法」。
+>
+> 修复：换页全程不放 `bpm_latch_`。代价是这条慢路径被串行化。
+> `DiskScheduler` 的后台线程不碰 `bpm_latch_`，所以锁内 `future.get()` 不会死锁。
 
 `WritePage` / `ReadPage` 是上面两个函数的 unwrap 包装，`nullopt` 时打印信息并 `std::abort()`。
 
@@ -416,8 +456,16 @@ frame_->rwlatch_  (std::shared_mutex，保护页面数据)
 ```
 
 - `ArcReplacer::latch_` 是叶子锁，在持有 `bpm_latch_` 时获取（`RecordAccess`/`SetEvictable`/`Evict`/`Remove`），不再向下嵌套。
-- `PageGuard::Drop()` 严格「先放`rwlatch_`，再拿 `bpm_latch_`」——因为反向持有会与 BPM 的获取顺序构成环。
-- 所有磁盘 IO 一律在**不持任何锁**的状态下进行。
+- `PageGuard::Drop()` 是「持 `bpm_latch_` → 归还 pin → 放`rwlatch_`」。这与 BPM 的获取顺序同向，不构成环，理由见 1.4 的说明。
+- **只有 Case A（命中，无 IO）会在构造 guard 前放开 `bpm_latch_`。** Case B / Case C 的换页 IO 在锁内完成，这是正确性要求，不是疏漏。
+
+两条支撑正确性的不变式，值得单独记住：
+
+1. **`pin_count == 0` ⇒ 该frame 的 `rwlatch_` 已经空闲。**（由 `Drop()` 的新顺序保证）
+   正因为如此，Case B / Case C 拿到的 frame 一定没人持有页面锁，
+   所以「持 `bpm_latch_` 时构造 guard」不会真的阻塞。
+2. **一个 frame 只要还能通过 `page_table_` 被找到，它的内容就是完整可用的。**
+   （由「换页 IO 在锁内完成」保证）
 
 ---
 
@@ -425,21 +473,44 @@ frame_->rwlatch_  (std::shared_mutex，保护页面数据)
 
 ###缺口
 
-1. **`ReadPageGuard::Flush()` 是空实现**（`page_guard.cpp:149`）。
+1. **`ReadPageGuard::Flush()` 是空实现**（`page_guard.cpp`）。
    当前依赖「读页不会脏」这一假设。但脏页是可能在 `WritePageGuard` 释放后仍留在 frame 里的，此时另一个线程拿 `ReadPageGuard` 再调 `Flush()` 就会静默什么都不做。若 Gradescope 有对应用例，需要补上「发写请求 + 清 `is_dirty_`」的逻辑（注意共享锁下清 `is_dirty_` 需要额外考虑同步）。
 
 2. **`src/buffer/lru_k_replacer.cpp` 完全未实现**。若课程/评测要求提交 LRU-K 版本，需要另行补齐；当前 BPM 只依赖 `ArcReplacer`。
 
+3. **换页被串行化了**。修掉换页竞态的代价是所有 eviction IO 串行执行。
+   功能测试全过，但 leaderboard 的吞吐会受影响。要恢复并发度需要引入「页面 IO 进行中」的状态机：
+   给 frame 加一个 `io_in_progress_` 标记 + 条件变量，让请求同一页的线程等待而不是看到半成品，
+   这样 IO 才能重新挪出 `bpm_latch_`。属于比较大的改造，目前没做。
+
+### 已修复（保留记录，避免重复踩坑）
+
+1. ~~**Case C 释放锁做写回 IO 存在竞态窗口**~~ → 已修，见 1.5 的「换页竞态」说明。
+   这条当初是作为「风险点，建议复核」记下的，后来果然就是并发丢 key 的真凶。
+2. ~~**`PageGuard::Drop()` 先放页面锁再减 pin**~~ → 已修，见 1.4。
+
+### 定位手法（值得复用）
+
+并发丢数据这类 bug 很难从代码上看出来，这次是靠**两个对照实验**定位的，方法可以复用：
+
+1. **单线程 vs 多线程**：写一个探针，用单线程复现多线程的插入顺序（跨步、交替、顺序），
+   并用 `IsTreeValid()` 校验结构。单线程全对 → 排除算法逻辑，锁定并发。
+2. **小缓冲池 vs 大缓冲池**：同样的多线程负载，`bpm_size=50`（频繁淘汰）会丢 key，
+   `bpm_size=5000`（几乎不淘汰）完全正常 → 直接把范围收缩到淘汰路径。
+
+第2 步是决定性的一击：它把「B+Tree 加锁协议有问题」和「缓冲池换页有问题」这两个
+看起来都说得通的猜想干净地区分开了。
+
 ### 风险点（建议复核）
 
-1. **`ArcReplacer::Size()` 没有加 `latch_`**（`arc_replacer.cpp:370`）。
+1. **`ArcReplacer::Size()` 没有加 `latch_`**。
    其他所有接口都用 `lock_guard` 保护了 `curr_size_`，唯独 `Size()` 裸读，在 TSan 下会被报成data race。加一行 `std::lock_guard` 即可。
 
 2. **`FrameStatus::it_` 的类型双关（type punning）**。
    `it_` 声明为 `std::list<frame_id_t>::iterator`，但在 `Dieout()` 中被赋值为 `list_ghost_.begin()`（类型是 `std::list<page_id_t>::iterator`）。
    目前能编译通过纯粹因为 `frame_id_t` 和 `page_id_t` **都是 `int32_t`**（见 `common/config.h:46-48`），两个模板实例化成了同一个类型。这是**依赖巧合的写法**，一旦哪天 `page_id_t` 改成 `int64_t` 就会直接编译失败。建议用 `std::variant` 或拆成两个成员。
 
-3. **`GetPinCount` 在 `unlock()` 之后才解引用迭代器**（`buffer_pool_manager.cpp:708-710`）。
+3. **`GetPinCount` 在 `unlock()` 之后才解引用迭代器**。
    ```cpp
    bpm_latch_->unlock();
    return frames_[it->second]->pin_count_.load();   // it 可能已失效
@@ -447,8 +518,6 @@ frame_->rwlatch_  (std::shared_mutex，保护页面数据)
    如果另一个线程在这两行之间执行了 `DeletePage`，`it` 就是悬垂迭代器。应该在放锁**之前**把 `it->second` 取出到局部变量。
 
 4. **`Evict()` 的判定用 `mru_.size() >= mru_target_size_`**，论文里是 `|T1| >= max(1, p)`。`mru_target_size_` 为 0 时行为略有差异，通常不影响正确性但会影响命中率（leaderboard 相关）。
-
-5. **Case C 中释放锁做写回 IO 存在竞态窗口**：`lk.unlock()` 到 `lk.lock()` 之间，被淘汰的 frame 已不在 replacer 里（`Evict` 已摘除）但 `page_table_` 里的旧映射还在。此时若另一线程请求那个旧 page_id，会命中 `page_table_` 拿到一个正在被写回/即将被复用的 frame。这是本实现的一个潜在正确性隐患，若遇到并发测试失败应优先排查此处。
 
 ---
 
@@ -507,9 +576,15 @@ IndexIterator                沿叶子链表推进，跳过 tombstone
 | `GetNextPageId` / `SetNextPageId` | 叶子链表指针 |
 | `KeyAt` / `ValueAt` | 返回值拷贝 |
 | `KeyAtRef` / `ValueAtRef` | 返回 `const&`，供 `IndexIterator::operator*` 返回引用对 |
-| `SetKeyValueAt(index, key, value)` | **自行新增**，key/value 成对写入，插入时的移位操作全靠它 |
-| `RemoveAt(index)` | **自行新增**，key/value 一起左移 + `ChangeSizeBy(-1)` |
+| `SetKeyValueAt(index, key, value)` | **自行新增**，原地覆写一对 KV，**不含** tombstone 记账（split / 复活时用） |
+| `InsertAt(index, key, value)` | **自行新增**，右移腾位 + `ChangeSizeBy(1)` + **同步修正 tombstone 下标** |
+| `RemoveAt(index)` | **自行新增**，左移 + `ChangeSizeBy(-1)` + **同步修正 tombstone 下标** |
 | `GetTombstones()` | 框架给定，把 `tombstones_[]` 里的下标翻译成 key 列表 |
+| tombstone 接口一组 | **自行新增**，见 2.7 |
+
+> 区分 `SetKeyValueAt` 和 `InsertAt` 很重要：前者是「裸写」，后者带记账。
+> split 时先用 `SetKeyValueAt` 批量重排entry、`SetSize()` 定尺寸，最后才`SetTombstoneIndexes()`
+> 统一重建记账；日常单条插入则一律走 `InsertAt`。混用会让 tombstone 下标错位。
 
 ---
 
@@ -518,113 +593,380 @@ IndexIterator                沿叶子链表推进，跳过 tombstone
 ```
 1. ReadPage(header_page_id_) → root_page_id_
    root == INVALID_PAGE_ID → return false（空树）
-2. 循环下降：
+2. 螃蟹式下降（先锁孩子再放父亲）：
    - IsLeafPage()? → 叶子内二分找 key
        找不到 → false
-       找到   → 遍历 GetTombstones()，若命中 tombstone 则视为不存在 → false
+       找到   → IsTombstoned(found)? 视为不存在 → false
        否则   → result->push_back(ValueAt(found)); return true
-   - 否则是内部页 → 二分找「最后一个 KeyAt(mid) <= key」的 mid 作为 child_idx
-                    current_page_id = ValueAt(child_idx)
+   - 否则是内部页 → ChildIndex() 二分找孩子，锁住它，再放开当前页
 ```
 
-内部页的二分模板（全文复用了 4 次，`GetValue` / `Insert` 两处 / `Remove` / `Begin(key)`）：
+内部页的二分已经抽成`ChildIndex()`（原来在 `GetValue` / `Insert` ×2 / `Remove` / `Begin(key)` 里重复了 5 遍）：
 
 ```cpp
-int child_idx = 0;                     // 默认走最左孩子
-int left = 1, right = size - 1;        // key[0] 无效，从 1 开始
-while (left <= right) {
-  int mid = left + (right - left) / 2;
-  if (comparator_(internal->KeyAt(mid), key) <= 0) { child_idx = mid; left = mid + 1; }
-  else                { right = mid - 1; }
+auto ChildIndex(const InternalPage *internal, const KeyType &key) const -> int {
+  int child_idx = 0;                     // 默认走最左孩子
+  int left = 1, right = internal->GetSize() - 1;   // key[0] 无效，从 1 开始
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    if (comparator_(internal->KeyAt(mid), key) <= 0) { child_idx = mid; left = mid + 1; }
+    else                { right = mid - 1; }
+  }
+  return child_idx;
 }
-current_page_id = internal->ValueAt(child_idx);
 ```
 
 语义：找**最后一个 `key[i] <= 目标 key`** 的 `i`，因为内部页的 `key[i]` 是「子树 i 的最小 key」。
 
-`GetValue` 全程只用 `ReadPage`（共享锁），下降过程中guard 是局部变量，随循环迭代自然析构，实现了「螃蟹加锁（crabbing）」的效果。
+### 螃蟹加锁（latch crabbing）—— 这里最初写错了
+
+> ⚠️笔记的第一版写的是「下降过程中 guard 是循环体内的局部变量，随循环迭代自然析构，
+> **实现了螃蟹加锁的效果**」。这是**错的**。看清楚作用域：
+>
+> ```cpp
+> while (true) {
+>   auto guard = bpm_->ReadPage(current_page_id);   // 拿子节点锁
+>   ...
+>   current_page_id = internal->ValueAt(child_idx);
+> }   // ← guard 在这里析构，父锁才被释放
+> ```
+>
+> `guard` 是**循环体内**的局部变量，每轮迭代结束就析构。真实顺序是
+> **「先放父锁 → 再拿子锁」**，中间存在一个不持任何锁的空窗。
+> 正确的 crabbing 必须是「先拿子锁 → 再放父锁」，需要同时持有两个 guard。
+>
+> `GetValue` 当时侥幸没出事，是因为它把header 的读锁一直持到函数返回
+> （函数作用域局部变量，从没`Drop()`），而所有结构性写操作都要 header 写锁，
+> 于是 header 锁意外充当了一把全局读写锁。但**乐观Insert 用了同样的下降模式却主动放掉了 header 读锁**，
+> 漏洞就从那里漏出来了。
+
+现在的写法用 `std::optional` 显式控制释放时机：
+
+```cpp
+std::optional<ReadPageGuard> protector = bpm_->ReadPage(header_page_id_);
+page_id_t cur_id = protector->As<BPlusTreeHeaderPage>()->root_page_id_;
+if (cur_id == INVALID_PAGE_ID) { return false; }
+
+std::optional<ReadPageGuard> cur = bpm_->ReadPage(cur_id);
+protector.reset();          // 拿到 root 读锁之后，才放开 header
+
+while (true) {
+  if (cur->As<BPlusTreePage>()->IsLeafPage()) { ...查找... }
+  auto internal = cur->As<InternalPage>();
+  cur_id = internal->ValueAt(ChildIndex(internal, key));
+  auto child = bpm_->ReadPage(cur_id);   // ① 先锁孩子
+  cur = std::move(child);                // ② 移动赋值内部先 Drop() 父亲，再接管孩子
+}
+```
+
+`cur = std::move(child)` 依赖 `ReadPageGuard::operator=(&&)` 的实现顺序：先 `Drop()` 自己（父亲），
+再接管 `that`（孩子）。而 `child` 早在赋值之前就已经加锁完成 —— 这正是 crabbing 要的顺序。
+
+`Begin()` / `Begin(key)` 也改成了同样的模式。
 
 ---
 
 ## 2.4 插入 Insert 与 InsertIntoParent
 
-### 三条路径
-
-**路径 0：空树**
-
-```cpp
-if (root_page_id == INVALID_PAGE_ID) {
-  auto header_w_guard = bpm_->WritePage(header_page_id_);   // 此时才升级为写锁
-  if (header_w_page->root_page_id_ == INVALID_PAGE_ID) {    // 双重检查（DCLP）
-    new_page_id = bpm_->NewPage();
-    root_leaf->Init(leaf_max_size_);
-    root_leaf->SetKeyValueAt(0, key, value);
-    root_leaf->SetSize(1);
-    header_w_page->root_page_id_ = new_page_id;
-    return true;
-  }
-}
-```
-
-先用读锁看到「空」，再拿写锁**重新确认一次**，防止两个线程同时建根。
+### 两条路径
 
 **路径 1：乐观路径（optimistic）**
 
-用 `ReadPage` 一路下降到叶子，只判断一件事：`leaf->GetSize() < leaf_max_size_`（不会分裂）。
-如果成立，记下 `target_leaf_page_id`，退出循环后单独 `WritePage(target_leaf_page_id)` 做插入：
+用 `CrabDownToLeaf()` 螃蟹式下降（全程读锁），到叶子时升级成写锁，只写**一个页**：
 
 ```cpp
-// 二分找插入位置，顺便查重复 key
-int insert_pos = leaf->GetSize();
-while (left <= right) {
-  int cmp = comparator_(leaf->KeyAt(mid), key);
-  if (cmp == 0) { return false; }                 // 唯一键，重复直接失败
-  if (cmp < 0)  { left = mid + 1; }
-  else          { insert_pos = mid; right = mid - 1; }
+page_id_t leaf_page_id; bool leaf_is_root;
+auto leaf_guard_opt = CrabDownToLeaf(key, &leaf_page_id, &leaf_is_root);
+if (leaf_guard_opt.has_value()) {
+  auto leaf = leaf_guard_opt->template AsMut<LeafPage>();
+  int insert_pos = 0;
+  int found = FindKeyInLeaf(leaf, key, &insert_pos);
+  if (found >= 0) {
+    if (leaf->IsTombstoned(found)) {          // tombstone 复活
+      leaf->ClearTombstoneAt(found);
+      leaf->SetKeyValueAt(found, key, value);
+      return true;
+    }
+    return false;                             // 真重复键
+  }
+  if (leaf->GetSize() < leaf_max_size_) {
+    leaf->InsertAt(insert_pos, key, value);   // 未满，直接插
+    return true;
+  }
+  // key 不存在 且 页满 → 必须分裂，落到悲观路径
 }
-// 从后往前移位腾出 insert_pos
-for (int i = leaf->GetSize(); i > insert_pos; i--) {
-  leaf->SetKeyValueAt(i, leaf->KeyAt(i - 1), leaf->ValueAt(i - 1));
-}
-leaf->SetKeyValueAt(insert_pos, key, value);
-leaf->ChangeSizeBy(1);
+// ★ 这个作用域必须在拿 header 写锁之前结束，把所有读锁放干净
 ```
 
-好处：绝大多数插入不会分裂，这条路径只对**一个页**加写锁，`header_page` 完全不碰，并发度远高于悲观路径。
+三点值得注意：
+
+1. **页满时也要先看key 是否已存在**。第一版的乐观路径只在 `size < max` 时才记下叶子页号，
+   于是「页已满 + key 是 tombstone」这种本来不需要分裂的情况被白白推到了悲观路径。
+2. **必须用 `{ }` 把乐观路径圈起来**，或者显式 `reset()`。
+   `std::shared_mutex`不支持锁升级，同一线程持着 header 读锁再去要 header 写锁会**自己锁死自己**
+   （`EDEADLK`，`std::shared_mutex::lock()` 抛 `std::system_error` → `terminate`）。
+   这正是 `MixTest` 最初挂死的直接原因。
+3. 好处：绝大多数插入不会分裂，这条路径只对一个页加写锁，`header_page` 只读一下就放，并发度远高于悲观路径。
 
 **路径 2：悲观路径（pessimistic / fallback）**
 
-只有乐观路径发现叶子已满时才进入：
+只有确实要分裂（或树为空要建根）时才进入：
 
 ```cpp
 Context ctx;
 ctx.header_page_ = bpm_->WritePage(header_page_id_);   // 全程持有 header 写锁
+page_id_t root_page_id = header_w_page->root_page_id_;
+
+if (root_page_id == INVALID_PAGE_ID) {
+  // 空树建根。此刻已独占 header 写锁，不存在竞争，无需双重检查
+  ...建一个只有一个 KV 的叶子当根...
+  return true;
+}
 ctx.root_page_id_ = root_page_id;
 // 用 WritePage 一路下降，每一层的 guard 都 push 进 ctx.write_set_
-while (true) {
-  auto guard = bpm_->WritePage(current_page_id);
-  if (page->IsLeafPage()) { leaf_guard = std::move(guard); break; }
-  ...二分找child...
-  ctx.write_set_.push_back(std::move(guard));// 保留父路径
-}
 ```
+
+> 💡 **空树建根从「双重检查」简化成了「在写锁内直接做」。**
+> 第一版是「先读锁看到空 → 再拿写锁 DCLP 复查」，而且**复查失败时忘了刷新 `root_page_id`**，
+> 竞争失败的线程会带着 `INVALID_PAGE_ID` 继续往下走，去 `ReadPage(-1)`。
+> 现在把建根挪进悲观路径，此时已独占 header 写锁，读到的值就是最终值，
+> 整个 DCLP 连同它的 bug 一起消失了 —— 这类「把竞态消灭在结构上，而不是补丁式修补」通常更可靠。
 
 `ctx.write_set_` 是一个「从根到叶父链的 guard 栈」。之所以要用它而不是局部变量：分裂需要向上递归修改父节点，`write_set_.back()` 就是当前父节点，处理完 `pop_back()` 继续往上，天然形成递归结构（这段推理在源码注释里也记了）。
 
-拿到写锁后**重新检查一次** `leaf->GetSize() < leaf_max_size_`（乐观路径判断和加锁之间状态可能已变），仍然没满就走普通插入。
+拿到写锁后**重新检查一次** `FindKeyInLeaf` 和 `GetSize() < leaf_max_size_`（乐观路径判断和加锁之间状态可能已变）。
+
+### CrabDownToLeaf：乐观路径的公共下降逻辑
+
+`Insert` 和 `Remove` 的乐观路径共用它。核心是一个**不变式**：
+
+> 循环中始终持有 `protector` —— 目标页**父亲**的读锁（根页的父亲就是 header page）。
+
+为什么这一把锁就够？因为「分裂 / 借位 / 合并 / 删页 / 换根」这些**改变一个页在树中位置**的操作，
+无一例外都要先写锁它的父亲。protector 在手，就没有任何线程能把我们脚下的页搬走。
+
+```cpp
+auto CrabDownToLeaf(const KeyType &key, page_id_t *leaf_page_id, bool *leaf_is_root)
+    -> std::optional<WritePageGuard> {
+  std::optional<ReadPageGuard> protector = bpm_->ReadPage(header_page_id_);
+  page_id_t cur_id = protector->As<BPlusTreeHeaderPage>()->root_page_id_;
+  if (cur_id == INVALID_PAGE_ID) { return std::nullopt; }   // 空树
+
+  bool is_root = true;
+  std::optional<ReadPageGuard> cur = bpm_->ReadPage(cur_id);
+
+  while (!cur->As<BPlusTreePage>()->IsLeafPage()) {
+    auto internal = cur->As<InternalPage>();
+    page_id_t child_id = internal->ValueAt(ChildIndex(internal, key));
+    auto child = bpm_->ReadPage(child_id);   // ① 先锁孩子
+    protector = std::move(cur);              // ② 父亲升级为 protector（旧 protector 在此释放）
+    cur = std::move(child);
+    cur_id = child_id; is_root = false;
+  }
+
+  // ③ shared_mutex 不支持锁升级 → 必须先放叶子读锁，再拿叶子写锁。
+  //    这个空窗是安全的：protector 还在手上，没人能分裂/删掉这个叶子。
+  cur.reset();
+  std::optional<WritePageGuard> leaf_guard = bpm_->WritePage(cur_id);
+  protector.reset();
+
+  *leaf_page_id = cur_id; *leaf_is_root = is_root;
+  return leaf_guard;
+}
+```
+
+三个容易踩的点：
+
+- **②的两行顺序不能换**。`protector = std::move(cur)` 会先释放旧 protector（祖父），
+  此时我们手上是「父亲 + 孩子」两把锁，从没出现空窗。
+  若换成 `cur = std::move(child); protector = std::move(cur);`，第一行就把父亲的锁 `Drop()` 掉了
+  （空窗回来了），而且 `protector` 会变成 `cur` 自己 —— 自己保护自己，毫无意义。
+- **③ 必须先 `cur.reset()`**。持读锁再要同一页的写锁 = 自锁死。
+- **`leaf_is_root` 要输出出去**。根叶子豁免 underflow 约束，但被删空时要改 header，
+  两种情况的「安全」判据不同。
+
+#### protector 是一个「角色」，不是某个固定的页
+
+它的定义是：
+
+```
+protector = 「想把 cur 从树里挪走，就必须先写锁的那个页」
+```
+
+对照 B+Tree 里所有会**改变一个页在树中位置**的操作，没有例外：
+
+| 操作 | 必须先写锁谁 |
+|---|---|
+| 分裂 `cur` | `cur` 的父亲（要往父亲里插 (key, 新页)） |
+| 从兄弟借位到 `cur` | `cur` 的父亲（要改分隔 key） |
+| 把 `cur` 合并掉 / 删掉 | `cur` 的父亲（`parent->RemoveAt`） |
+| `cur` 是根，要换根 | header page（要改 `root_page_id_`） |
+
+最后一行让这个角色**统一**了：根页的「父亲」就是 header page，不需要写特例
+——所以根叶子情况下循环一次都不执行，`protector` 自然就停在 header guard 上。
+
+「父亲升级为 protector」升级的是**职责**，不是锁的模式（全程都是读锁）。
+
+#### 逐步的锁状态追踪
+
+树为 `header → R(根,内部页) → I(内部页) → L(叶子)`：
+
+| 步骤 | protector | cur | 实际持有的锁 |
+|---|---|---|---|
+| 初始 | header | — | header |
+| `cur = ReadPage(R)` | header | R | header + R |
+| 第 1 轮 ① `child = ReadPage(I)` | header | R | header + R + **I** |
+| 第 1 轮 ② `protector = move(cur)` | **R** | (空壳) | ~~header~~ R + I |
+| 第 1 轮 ③ `cur = move(child)` | R | I | R + I |
+| 第 2 轮 ① `child = ReadPage(L)` | R | I | R + I + **L** |
+| 第 2 轮 ② `protector = move(cur)` | **I** | (空壳) | ~~R~~ I + L |
+| 第 2 轮 ③ `cur = move(child)` | I | L | I + L |
+| 退出循环 | I | L | I + L |
+| `cur.reset()` | I | — | **只剩 I** ← 关键时刻 |
+| `WritePage(L)` | I | — | I(读) + L(**写**) |
+| `protector.reset()` | — | — | L(写) |
+
+规律：**循环里每一轮 `protector` 始终是 `cur` 的父亲**，每下降一层交接一次。
+第 ② 步会短暂同时持有 3 把锁，然后降回 2 把。
+
+#### 为什么下降过程中非要留着父亲
+
+单看下降，其实**不需要** protector —— `GetValue` 的循环里就没留：
+
+```cpp
+auto child = bpm_->ReadPage(current_page_id);
+cur = std::move(child);      // 移动赋值先Drop() 父亲，再接管孩子 → crabbing 已成立
+```
+
+`CrabDownToLeaf` 多留一把，唯一原因是它多了一步**读锁 → 写锁的升级**。
+`std::shared_mutex` 不支持升级，只能「先放叶子读锁，再拿叶子写锁」，
+这中间对叶子**什么锁都没有**。如果此时手上再没别的锁：
+
+- 并发 `Remove` 可以把这个叶子合并掉、`DeletePage` 掉 → 我们随后写进一个已回收/被复用的 frame
+- 或者叶子还在但被分裂过了，这个 key 已经不属于它 → 插到错误的页上，叶子层有序性静默损坏
+
+**protector 就是为了在这个升级空窗里救命的。** 因为到达叶子之前不知道谁会是叶子的父亲，
+只能每一层都把「父亲」这个位置占住。
+
+---
+
+### 乐观 vs 悲观：protector 与 `ctx.write_set_` 的分工
+
+>这一节对 `Insert` 和 `Remove` 都适用。
+
+初学最容易产生的疑问是：**「有了 protector，是不是就不用维护 `ctx.write_set_` 那条根到叶的父链了？」**
+不是。`ctx.write_set_` 一点没减少，它在悲观路径里被用了十几处。两条路径**并存**，
+因为这两个东西解决的是**完全不同的两个问题**：
+
+| | 要解决的问题 | 需要的锁 |
+|---|---|---|
+| **保护**（defense） | 别人不能把我脚下的页**挪走** | **读**锁，只需要**父亲**一把 |
+| **修改可达性**（offense） | 我要亲手**改**祖先节点，就必须**握着它们的写锁** | **写**锁，需要**整条链** |
+
+`protector` 只解决第一件，`ctx.write_set_` 解决第二件。
+**乐观路径的前提就是「我保证一个内部页都不改」**，所以第二件事对它根本不存在。
+
+#### 乐观路径为什么真的不改内部页
+
+它的每一个出口都只碰**一个叶子**：
+
+| 出口 | 改了什么 |
+|---|---|
+| 重复键 | 什么都不改，`return false` |
+| tombstone 复活 | 叶子里一个 value + 一条 tombstone 记录 |
+| 未满插入 /安全删除 | 只动这个叶子的数组，`size` 不越界，不改 `next_page_id_` |
+| **判据不成立** | **立刻放弃，退回悲观路径** |
+
+最后一条是关键：**乐观路径的判据就是「这次操作不会传播到父节点」**
+（插入看 `size < max`，删除看 `size - 1 >= GetMinSize()`）。
+判据不成立就不走，所以它永远不需要访问父节点。
+
+#### 悲观路径为什么必须攥住整条链
+
+因为**分裂/合并会链式向上传播，而且传播多远事先不知道**。
+
+走一遍最坏情况，树 `header → R → I → L`，插入导致 L 满了：
+
+```
+① 分裂 L → L / L_new，要往I 里插一条 (push_up_key, L_new)
+   → 必须持有 I 的写锁                ← write_set_ 栈顶
+
+② 结果 I 也满了 → 分裂 I → I / I_new，要往 R 里插一条
+   → 必须持有 R 的写锁                    ← pop 掉 I，栈顶变成 R
+
+③ 结果 R 也满了 → R 是根 → 新建根，要改 header 的 root_page_id_
+   → 必须持有 header 的写锁                ← ctx.header_page_
+```
+
+**② 和 ③ 是在 ① 已经开始改数据之后才知道要做的。**
+如果只留父亲，走到 ② 就没救了：祖父 R 的锁早放了，要改它只能重新 `WritePage(R)`，于是
+
+1. **加锁顺序反了** —— 我们持着 I 的写锁去要 R 的写锁，而所有正常下降都是 R → I 方向。
+   两个方向相反的线程一撞就是死锁。
+2. **中途状态可能已变** —— 放开 R 的那一瞬间别人可能已经把 R 分裂了，
+   `I` 在 R 里的槽位（`ValueIndex`）都不一样了。
+
+所以只能一路下降时就把写锁全部攥住，宁可牺牲并发度。
+
+`Remove` 的传播链更长：合并完叶子后父节点少一个 child，可能也underflow，
+要继续向上借位/合并，一直可能传到根收缩。代码里那个
+`while (parent->GetSize() < internal_min && !ctx.write_set_.empty())`
+就是「沿着 `write_set_` 一层层往上爬」——**没有整条链，这个循环根本写不出来**。
+
+#### 对比总表
+
+| | 乐观路径 | 悲观路径 |
+|---|---|---|
+| 持有什么 | `protector`（父亲**读**锁）+ 叶子**写**锁 | header **写**锁 + `write_set_`（整条链**写**锁）+ 叶子写锁 |
+| 锁的数量 | 2 | 树高 + 2 |
+| 目的 | 保护（别人别动我） | 修改可达性（我要改祖先） |
+| 会改内部页吗 | **不会**（这是它成立的前提） | 会，可能一直改到根 |
+| 并发度 | 高，不同子树互不干扰 | 极低，header 写锁把所有写者串行化 |
+| 页面写次数 | **1**（这正是 `OptimisticDeleteTest` 要的） | 树高 + 1 |
+| 何时使用 | 判据成立：不满 / 不 underflow / key 已存在 | 判据不成立：要分裂 / 会 underflow / 建根 / 换根 |
+
+#### 两者的衔接：放手重做，不是补锁续跑
+
+乐观失败时**不是**「补上写锁继续」，而是彻底释放、从header 重新下降一遍：
+
+```cpp
+{
+  ...乐观路径...
+  // leaf_guard_opt 在此析构。必须在拿 header 写锁之前把所有读锁放干净，
+  // 否则同一线程「读锁 header → 写锁 header」会自己把自己锁死
+}
+Context ctx;
+ctx.header_page_ = bpm_->WritePage(header_page_id_);   //重新开始
+```
+
+那个 `{ }` 作用域是**必需**的（`shared_mutex` 不支持升级）。
+悲观路径到叶子后还会**重新做一次判定**，因为乐观探测和重新加锁之间状态可能已变。
+
+代价是白走一趟下降。`InsertTest2`（`leaf_max=3`，几乎每次插入都分裂）跑 20 秒，
+主要开销就在「乐观失败 → 悲观重做」的双倍下降上。
+
+> **一句话记住**：
+> `protector` 是**防守**用的，一把父亲的读锁就能挡住所有想挪动叶子的人；
+> `ctx.write_set_` 是**进攻**用的，你要亲手改哪些页就得握着哪些页的写锁，
+> 而分裂/合并会一路传播到根，所以必须攥住整条链。
+> 乐观路径能只用 2 把锁，唯一原因是它**主动限定自己只改一个叶子**，
+> 一旦发现要动内部页就立刻认输退场。
+
+---
 
 ### 叶子分裂
 
 ```
 1. total = size + 1，split = total / 2
-2. 二分找新 key 在原叶子中的位置 new_insert_pos（顺便查重复 → return false）
+2. 新 key 的位置直接复用上面 FindKeyInLeaf 的 insert_pos（不再重复二分）
 3. 三段式填入临时 vector：
    [0, new_insert_pos)  ← 原叶子
    [new_insert_pos]     ← 新 KV
    [new_insert_pos+1, total) ← 原叶子剩余（下标 +1）
 4. NewPage() + Init()，原叶子截断为前 split 个，新叶子装后 (total - split) 个
-5. 修链表： new_leaf->next = old_leaf->next;  old_leaf->next = new_page_id;
-6. push_up_key = new_leaf->KeyAt(0)，调InsertIntoParent(leaf_page_id, push_up_key, new_page_id, ctx)
+5. tombstone 按 key 落到哪一页分派过去，且保持 FIFO 相对顺序（详见 2.7）
+6. 修链表： new_leaf->next = old_leaf->next;  old_leaf->next = new_page_id;
+7. push_up_key = new_leaf->KeyAt(0)，调InsertIntoParent(leaf_page_id, push_up_key, new_page_id, ctx)
 ```
 
 用 `std::vector<KeyType>` / `std::vector<ValueType>` 做临时数组（而不是 VLA，VLA 不是标准 C++）。
@@ -691,9 +1033,51 @@ parent->ChangeSizeBy(1);
 
 ## 2.5 删除 Remove
 
-`Remove` 是 P2 最长的一段（约 300 行），走的是完整的悲观路径。
+`Remove` 是 P2 最长的一段（约 380 行），分乐观 / 悲观两条路径。
+两条路径的分工、以及「为什么乐观路径不需要 `ctx.write_set_`」，见 2.4 的
+[乐观 vs 悲观：protector 与 `ctx.write_set_` 的分工](#乐观-vs-悲观protector-与-ctxwrite_set_-的分工)。
 
-### 下降阶段
+### 乐观路径：一次删除只写一个页
+
+绝大多数删除既不借位也不合并，更不需要改父节点和 header。这条路径用 `CrabDownToLeaf()`
+读锁下降，只对目标叶子加一次写锁：
+
+```cpp
+auto leaf_guard_opt = CrabDownToLeaf(key, &opt_leaf_page_id, &leaf_is_root);
+if (!leaf_guard_opt.has_value()) { return; }          // 空树
+
+int found = FindKeyInLeaf(opt_leaf, key, &opt_insert_pos);
+if (found == -1) { return; }                          // key 不存在
+if (opt_leaf->IsTombstoned(found)) { return; }        // 已逻辑删除，幂等
+
+// tombstone 缓冲区还有空位 → 纯逻辑删除，物理结构完全不变
+if (TombCapacity() > 0 && opt_leaf->GetNumTombstones() < TombCapacity()) {
+  opt_leaf->AddTombstone(found);
+  return;
+}
+
+// 需要真正物理删掉一条，先判断会不会破坏最小占用约束
+bool safe = leaf_is_root ? (opt_leaf->GetSize() - 1 > 0)                // 根叶子豁免 underflow，
+                                // 但被删空要改 header
+                         : (opt_leaf->GetSize() - 1 >= opt_leaf->GetMinSize());
+if (safe) { ...直接删... return; }
+// 会 underflow（或要改 header）→ 释放所有锁，退化到悲观路径重做
+```
+
+>💡 **为什么这条路径是必须的（不只是优化）**：
+> `b_plus_tree_delete_test.DISABLED_OptimisticDeleteTest` 会数页面加锁次数
+> （`TracedBufferPoolManager::GetReads/GetWrites` 统计的是 `ReadPage`/`WritePage`
+> **调用次数**，不是磁盘 IO）：
+>
+> ```cpp
+> EXPECT_GT(new_reads - base_reads, 0);      // 要有读页
+> EXPECT_EQ(new_writes - base_writes, 1);    // 只能写 1 个页
+> ```
+>
+> 只有悲观路径时是 5 次写 / 0 次读（header + 整条路径全用`WritePage`）；
+> 加上乐观路径后变成 1 次写（只写叶子）/ 若干次读（header + 各层内部页），测试才过。
+
+### 悲观路径：下降阶段
 
 ```cpp
 Context ctx;
@@ -703,13 +1087,18 @@ if (root_page_id == INVALID_PAGE_ID) { return; }
 // WritePage 一路下降，父路径存ctx.write_set_，叶子 guard 单独存leaf_guard
 ```
 
-### 定位与删除
+### 定位与删除（tombstone 优先）
 
 ```cpp
 // 1. 叶子内二分找 key，找不到 → return
-// 2. 检查 GetTombstones()，已被逻辑删除 → return
-// 3. leaf->RemoveAt(found)← 物理删除
+// 2. IsTombstoned(found)? 已被逻辑删除 → return
+// 3. tombstone 缓冲区有空位 → AddTombstone，结构不变，直接 return
+// 4. 缓冲区满 → 淘汰队首（最老）那条，把它「兑现」成物理删除腾出位置，
+//    再把当前 key 记为新tombstone。此时 size 减 1，才可能 underflow
+// 5.容量为 0（NumTombs <= 0）→ 退化成纯物理删除
 ```
+
+详细的 tombstone 规则见 2.7。
 
 ### 情况 1：叶子就是根
 
@@ -725,15 +1114,20 @@ if (ctx.write_set_.empty()) {          // 没有父节点 → 叶子是根
 ```
 
 `leaf_guard.Drop()` 必须在 `DeletePage` 之前——否则 `pin_count > 0`，`DeletePage` 会返回 false。
+（这条约束在并发下还依赖 `Drop()` 的正确顺序，见 1.4。）
 
 ### 情况 2：叶子层 underflow 处理
 
 ```cpp
-int leaf_min = (leaf_max_size_ + 1) / 2;
+int leaf_min = leaf->GetMinSize();                  // 统一用 GetMinSize()，不再自己算
 if (leaf->GetSize() >= leaf_min) { return; }        // 没下溢，结束
 
 int idx = parent->ValueIndex(leaf_page_id);         // 当前叶子在父节点中的槽位
 ```
+
+> 💡 原来这里写的是 `(leaf_max_size_ + 1) / 2`，而 `BPlusTreePage::GetMinSize()` 对叶子返回 `max / 2`。
+> `max` 为奇数时两者差 1（如 max=5：`2` vs `3`）。测试里直接用 `GetMinSize()`做断言
+> （`EXPECT_EQ(2, GetMinSize())`、`EXPECT_GE(GetSize(), GetMinSize())`），所以口径必须统一到 `GetMinSize()`。
 
 按标准的四步优先级：
 
@@ -877,17 +1271,17 @@ while (true) {
     continue;
   }
 
-  // 在页内范围内，但可能是 tombstone
-  KeyType current_key = leaf->KeyAt(index_);
-  bool deleted = false;
-  for (const auto &tomb_key : leaf->GetTombstones()) {
-    if (comparator_(tomb_key, current_key) == 0) { deleted = true; break; }
-  }
-  if (deleted) { index_++; continue; }
+  // 在页内范围内，但可能是 tombstone。
+  // 按「下标」判定，不做 key 比较：tombstones_ 里存的本来就是 key_array_ 的下标
+  if (IsCurrentEntryDeleted(leaf)) { index_++; continue; }
 
   return;      // 停在合法可见位置
 }
 ```
+
+`IsCurrentEntryDeleted()` 在头文件里**声明了却一直没定义**（因为没人调用，显式实例化也只会生成声明，
+不会报链接错误，所以一直没被发现）。现在把它实现成 `leaf->IsTombstoned(index_)`，
+省掉 comparator 调用，也不依赖 key 的唯一性。
 
 用 `while` 循环而不是单次判断，是因为可能需要**连续多次**推进（源码注释里列了三种情形）：
 1. 越过当前页末尾要跳页；
@@ -916,41 +1310,159 @@ auto operator++() { if (!IsEnd()) { index_++; AdvanceToNextVisible(); } return *
 
 ---
 
-## 2.7 P2 遗留缺口与风险
+## 2.7 Tombstone 懒删除
+
+叶子页里有一块**容量固定为 `NumTombs` 的 tombstone 缓冲区**，用来做逻辑删除。
+课程 writeup 不在仓库里，下面的语义是**从 `b_plus_tree_tombstone_test` 的 4 个用例反推**出来的。
+
+### 先修一个致命的类型 bug
+
+`b_plus_tree.h` 里的类型别名漏传了 `NumTombs`：
+
+```cpp
+using LeafPage = BPlusTreeLeafPage<KeyType, ValueType, KeyComparator>;   // ← NumTombs 丢了
+```
+
+而 `NumTombs` 默认值是 `0`（`b_plus_tree_page.h:28`），于是 `LEAF_PAGE_TOMB_CNT = 0`，
+`tombstones_[0]` 是零长数组。也就是说 **`BPlusTree<..., 2>` 内部一直在用「0 个 tombstone 槽」
+的页面布局，而测试用「2 个槽」的布局去读同一块内存** —— 连`LEAF_PAGE_SLOT_CNT` 都不一样。
+对比 `index_iterator.h:64` 是写对了的，只有树本身漏了。这个不修，后面一切都是空谈。
+
+### 三条从测试反推出的规则
+
+**规则 1：FIFO 队列，`tombstones_[0]` 最老，存的是「下标」不是 key。**
+
+`GetTombstones()` 的实现是 `key_array_[tombstones_[i]]`。这个设计决定了
+**任何移动 entry 的操作都必须同步修正下标** —— 这是整个实现最容易错的地方。
+所以把记账收进页面层，让上层不用操心：
+
+```cpp
+void RemoveAt(int index) {
+  ClearTombstoneAt(index);                                // 指向被删 entry 的记录要删掉
+  for (i) if (tombstones_[i] > index) tombstones_[i]--;      // 后面的整体左移
+  ...搬 entry...
+}
+void InsertAt(int index, key, value) {
+  ...右移 entry...
+  for (i) if (tombstones_[i] >= index) tombstones_[i]++;     // 后面的整体右移
+  ...
+}
+```
+
+`AddTombstone()` 用 `num_tombstones_ >= TombCapacity()` 做守卫 ——
+容量为 0 时 `0 >= 0` 成立直接返回 false，顺带避免了对零长数组的越界写。
+
+来源：`TombstoneBasicTest` 的「处理顺序」段。连删 3 个 key（容量 2），期望剩 `[d1, d2]`
+且 `d0` 变成物理删除 → 缓冲区满时**淘汰队首并把它兑现成物理删除**。
+
+**规则 2：split 时按 key 落到哪一页分派，保持 FIFO 相对顺序。**
+
+```cpp
+for (i in旧页 tombstone) {
+  t = TombKeyIndexAt(i);
+  if (t >= new_insert_pos) { t++; }      // 新 key 插进来会把后面的顶开一格
+  if (t < split) { left_tombs.push(t); }
+  else           { right_tombs.push(t - split); }
+}
+```
+
+遍历顺序即 FIFO 顺序，所以相对新旧关系天然保留。
+注意 `SetTombstoneIndexes()` 要在 entry 都搬完、`SetSize()` 定下来**之后**再调用
+（它内部有 `tombstones_[i] < GetSize()` 的断言）。
+
+**规则 3：merge 时「目标页的 tombstone 排在 FIFO 前面」，超容量则从队首兑现。**
+
+`TombstoneCoalesceTest` 期望：左页存活 → tombstone 是右页的 `[6,3]`；右页存活 → 是左页的 `[1,2]`。
+唯一能同时满足两个分支的解释就是：
+
+```
+合并后 FIFO = 目标页自己的（较老，排前面） + 被吸收页的（下标 += base）
+然后从队首淘汰到装得下 —— 于是目标页自己的 tombstone 先被兑现掉
+```
+
+```cpp
+void FlushTombstonesToFit(LeafPage *page, std::vector<size_t> &tombs) {
+  page->ClearTombstones();        // 记账权临时收到外部 vector，避免和 RemoveAt 的自动修正打架
+  while (tombs.size() > LeafPage::TombCapacity()) {
+    size_t victim = tombs.front(); tombs.erase(tombs.begin());
+    page->RemoveAt(victim);
+    for (auto &t : tombs) { if (t > victim) { t--; } }
+  }
+  page->SetTombstoneIndexes(tombs);
+}
+```
+
+### 其余两条约定
+
+**Insert 命中 tombstone = 复活**：撤掉 tombstone 并**覆盖 value**，返回 true（不是重复键）。
+`TombstoneBasicTest` 会检查复活后 `GetValue`拿到的是**新** RID。
+
+**borrow 不借 tombstone 条目**：
+
+```cpp
+if (left_sib->GetSize() > leaf_min && !left_sib->IsTombstoned(last)) { ...借... }
+```
+
+借一个不可见的 entry过来根本缓解不了 underflow，还要跨页搬 tombstone 记账。
+加上这个条件后，`TombstoneBorrowTest` 自动落到 merge 分支，结果正好是期望的 `[2]`。
+
+### 「删空的树」不是空树
+
+`TombstoneBasicTest` 最后把 17 个 key 全删掉，然后断言：
+
+```cpp
+EXPECT_GT(tot_tombs, ((num_keys - 1) / 4) * 2);   // 页面没有被物理清空
+EXPECT_LT(tot_tombs, num_keys);
+EXPECT_EQ(tree.Begin().IsEnd(), true);           // 但迭代器要表现为空
+```
+
+这个行为是自然涌现的：一旦某个叶子的所有 entry 都被 tombstone 了，
+后续删除都会命中「已 tombstone → 直接 return」，页面就不再收缩。
+当 `容量 <= min` 时叶子最终稳定在 `size == min` 且全部 tombstone，永远不会 underflow。
+
+---
+
+## 2.8 P2 遗留缺口与风险
 
 ### 缺口
 
-1. **Tombstone 懒删除机制没有实现**（`b_plus_tree.cpp:704` 注释「优先 tombstone 懒删除，先不管这个」）。
+1. **merge 后的二次 underflow 未处理**。
+   极端情况下 `size_左 + size_右 - 容量` 仍可能小于 `min`（需要 `容量 > min` 才会发生）。
+   4 个 tombstone 测试里 `容量 <= min`，都不触发。要彻底解决得把叶子层的 underflow 也改成循环。
 
-   现状是一个**半成品状态**：
-   - 读路径的 tombstone 过滤**已经写好了**：`GetValue()` 会查 `GetTombstones()`，`IndexIterator::AdvanceToNextVisible()` 会跳过 tombstone，`Remove()` 也会检查「是否已被 tombstone」。
-   - 但**没有任何代码往`tombstones_[]` 里写**。`LeafPage::Init()` 把 `num_tombstones_` 置0 之后，这个值永远是 0。
-   - 所以 `Remove()` 走的是纯物理删除 + 借位/合并路径，上面那些过滤逻辑**永远不会被触发**（是死代码）。
+2. **悲观路径不做「安全节点提前释放」**。
+   `ctx.write_set_` 只增不减，所以一次操作会 pin 住 `header + 整条根到叶路径 + 兄弟页`。
+   探针里试过 `internal_max=2` 的退化配置（fanout 只有 1~2，树极深），
+   会直接 `CheckedWritePage failed to bring in page` 而 abort。正常参数下没问题，但这是已知边界。
+   正确做法是下降时若某内部页「安全」（插入看 `size < max`，删除看 `size > min`），
+   说明修改不会传播到它之上，立刻 `ctx.write_set_.clear()` 释放所有祖先。
 
-   要补的话，需要在 `b_plus_tree_leaf_page.cpp` 里新增「写入 tombstone」的方法（记录被删 key 的下标到 `tombstones_[]`、维护 `num_tombstones_`），并在 `Remove()` 里优先走懒删除、达到阈值后再触发真正的物理压缩。
+3. **迭代器与借位的加锁方向相反**。
+   迭代器沿叶子链表**左 → 右**推进（`guard_ = bpm_->ReadPage(next)` 先锁下一页再放当前页）；
+   而 `Remove` 向左兄弟借位/合并时是**当前页 → 左兄弟**，即右 → 左。
+   理论上构成环。目前没触发，是因为所有结构性写操作都被 header 写锁串行化了，
+   同一时刻只有一个写者；但这是**靠外层串行化兜住的**，不是加锁协议本身正确。
 
-2. **`GetMinSize()` 与 `Remove()` 里的最小尺寸不一致**。
-   - `BPlusTreePage::GetMinSize()`：叶子返回 `GetMaxSize() / 2`
-   - `Remove()` 里：`int leaf_min = (leaf_max_size_ + 1) / 2;`
+### 已修复（保留记录）
 
-   `max` 为奇数时两者差1（如 max=5：`5/2 = 2` vs `(5+1)/2 = 3`）。目前 `Remove()` 没有调 `GetMinSize()`，所以行为是自洽的，但两个来源并存容易在后续修改时踩坑。建议统一到`GetMinSize()`。
+1. ~~**tombstone 懒删除完全没实现**~~ → 已实现，见 2.7。
+2. ~~**`Insert` 乐观路径 TOCTOU**~~ → 已修：真 crabbing + `CrabDownToLeaf`。
+3. ~~**`Remove` 每次都抢 header 写锁**~~ → 已修：加了乐观路径。
+4. ~~**`GetMinSize()` 与 `Remove()` 最小尺寸口径不一致**~~ → 已统一到 `GetMinSize()`。
+5. ~~**`GetRootPageId()` 用了 `WritePage`**~~ → 已改成 `ReadPage`。
+6. ~~**空树 DCLP 失败后没刷新 `root_page_id`**~~ → 已消除（建根挪进悲观路径的写锁内）。
+7. ~~**`IndexIterator::IsCurrentEntryDeleted` 声明未定义**~~ → 已实现。
 
 ### 风险点（建议复核）
 
-1. **`Insert` 乐观路径存在 TOCTOU 竞态**。
-   下降时用 `ReadPage` 判断 `leaf->GetSize() < leaf_max_size_`，然后**释放读锁**、退出循环、再 `WritePage(target_leaf_page_id)`。这两步之间叶子可能被其他线程插满甚至分裂掉。
-   代码在拿到写锁后**重新检查了一次** `GetSize() < leaf_max_size_`（`b_plus_tree.cpp:268`），所以不会写溢出，会退化到悲观路径——这部分是安全的。
-   但更隐蔽的问题是：期间叶子若发生**分裂**，`target_leaf_page_id` 可能已不再是该 key 应该去的那个叶子，插入就会落到错误的页上，破坏有序性。这是并发测试下需要重点验证的地方。
+1. **tombstone 检查是 O(NumTombs) 线性扫描**，在 `GetValue` / `Remove` / 每次迭代器推进时都做。
+   `NumTombs` 很小所以现在无所谓，但如果容量调大会成为热点。
 
-2. **`Remove()` 对每次删除都抢 `header_page` 的写锁**（`b_plus_tree.cpp:629`）。
-   这会把所有 Remove 完全串行化。函数开头的注释其实提到了「正确的实现下只有目标叶子需要写一次」，但实现并没有做乐观路径。若要提升并发度（leaderboard），应该像 `Insert` 一样加一条乐观路径：先用读锁探测「删除后不会 underflow」，再只锁目标叶子。
+2. **`Remove` 的借位/合并没有校验兄弟页类型**。`AsMut<LeafPage>()` 是无检查的 reinterpret，依赖「同一层的兄弟必然同类型」这一不变式。正确前提下没问题，但调试期若树结构被破坏，会表现为难以定位的内存乱码而非断言失败。
 
-3. **`GetRootPageId()` 用了 `WritePage`**（`b_plus_tree.cpp:1060`）。
-   只是读一个字段却拿了排他锁，应改为 `ReadPage`。
-
-4. **tombstone 检查是 O(num_tombstones) 线性扫描**，且在 `GetValue` / `Remove` / 每次迭代器推进时都做。如果后续真的实现了tombstone，这里会成为热点。
-
-5. **`Remove` 的借位/合并没有校验兄弟页类型**。`AsMut<LeafPage>()` 是无检查的 reinterpret，依赖「同一层的兄弟必然同类型」这一不变式。正确前提下没问题，但调试期若树结构被破坏，会表现为难以定位的内存乱码而非断言失败。
+3. **乐观路径失败时会整体重做一遍下降**。`leaf_max_size` 很小（比如 3）时几乎每次插入都分裂，
+   于是「读锁下降 + 写锁下降」双倍开销。`InsertTest2`（1000 key × 50 轮，leaf_max=3）
+   跑 20 秒左右，主要开销在这里。可以考虑在乐观路径就判断「叶子已满」并跳过后续检查。
 
 ---
 
@@ -958,35 +1470,80 @@ auto operator++() { if (!IsEnd()) { index_++; AdvanceToNextVisible(); } return *
 
 ## Project 1
 
-| 文件 | 行数 | 完成度 | 内容 |
-|---|---|---|---|
-| `src/storage/disk/disk_scheduler.cpp` | 79 | ✅ | 后台线程、请求队列、读写分派、毒丸退出 |
-| `src/buffer/arc_replacer.cpp` | 376 | ✅ |ARC 全套：`Evict` / `RecordAccess` / `SetEvictable` / `Remove` / `Size` + 自建 `Dieout` |
-| `src/include/buffer/arc_replacer.h` | 95 | ✅ | 四列表 + 两哈希索引 + `FrameStatus`（含链表迭代器）+ `Dieout` 声明 |
-| `src/storage/page/page_guard.cpp` | 381 | ⚠️ | 读/写 guard 的构造、移动语义、`Drop`、`WritePageGuard::Flush`；**`ReadPageGuard::Flush()` 为空** |
-| `src/buffer/buffer_pool_manager.cpp` | 716 | ✅ | `NewPage` / `DeletePage` / `CheckedRead(Write)Page` 三情况 / `Flush*` 四函数 / `GetPinCount` |
-| `src/buffer/lru_k_replacer.cpp` | 107 | ❌ | 未实现（本实现走 ARC，此文件被绕过） |
+| 文件 | 完成度 | 内容 |
+|---|---|---|
+| `src/storage/disk/disk_scheduler.cpp` | ✅ | 后台线程、请求队列、读写分派、毒丸退出 |
+| `src/buffer/arc_replacer.cpp` | ✅ |ARC 全套：`Evict` / `RecordAccess` / `SetEvictable` / `Remove` / `Size` + 自建 `Dieout` |
+| `src/include/buffer/arc_replacer.h` | ✅ | 四列表 + 两哈希索引 + `FrameStatus`（含链表迭代器）+ `Dieout` 声明 |
+| `src/storage/page/page_guard.cpp` | ⚠️ | 读/写 guard 的构造、移动语义、`WritePageGuard::Flush`；**`Drop()` 顺序已修正**（先归还 pin 再放页锁）；`ReadPageGuard::Flush()` 仍为空 |
+| `src/buffer/buffer_pool_manager.cpp` | ✅ | `NewPage` / `DeletePage` / `CheckedRead(Write)Page` 三情况 / `Flush*` 四函数 / `GetPinCount`；**换页竞态已修**（Case B/C 全程持锁） |
+| `src/buffer/lru_k_replacer.cpp` | ❌ | 未实现（本实现走 ARC，此文件被绕过） |
 
 ## Project 2
 
-| 文件 | 行数 | 完成度 | 内容 |
-|---|---|---|---|
-| `src/storage/page/b_plus_tree_page.cpp` | 80 | ✅ | 类型/尺寸的全部 getter/setter + `GetMinSize` |
-| `src/storage/page/b_plus_tree_internal_page.cpp` | 112 | ✅ | `Init` / `KeyAt` / `SetKeyAt` / `ValueAt` / `ValueIndex` + 新增 `SetValueAt` `RemoveAt` |
-| `src/storage/page/b_plus_tree_leaf_page.cpp` | 135 | ⚠️ | `Init` / 链表指针 / `KeyAt(Ref)` / `ValueAt(Ref)` + 新增 `SetKeyValueAt` `RemoveAt`；**无tombstone 写入方法** |
-| `src/storage/index/b_plus_tree.cpp` | 1081 | ⚠️ | `IsEmpty` / `GetValue` / `Insert`（乐观+悲观+分裂）/ `InsertIntoParent`（递归）/ `Remove`（借位+合并+根收缩）/ `Begin` / `Begin(key)` / `End` / `GetRootPageId`；**tombstone 懒删除未做** |
-| `src/storage/index/index_iterator.cpp` | 143 | ✅ | 构造 / `IsEnd` / `operator*` / `operator++` + 自建 `AdvanceToNextVisible`（跨页 + 跳 tombstone） |
+| 文件 | 完成度 | 内容 |
+|---|---|---|
+| `src/include/storage/index/b_plus_tree.h` | ✅ | **修`LeafPage` 别名漏传 `NumTombs`**；新增 `FindKeyInLeaf` / `ChildIndex` / `CrabDownToLeaf` / `FlushTombstonesToFit` 声明 |
+| `src/storage/page/b_plus_tree_page.cpp` | ✅ | 类型/尺寸的全部 getter/setter + `GetMinSize` |
+| `src/storage/page/b_plus_tree_internal_page.cpp` | ✅ | `Init` / `KeyAt` / `SetKeyAt` / `ValueAt` / `ValueIndex` + 新增 `SetValueAt` `RemoveAt` |
+| `src/include/storage/page/b_plus_tree_leaf_page.h` | ✅ | 新增整套 tombstone 接口 + `InsertAt` 声明 |
+| `src/storage/page/b_plus_tree_leaf_page.cpp` | ✅ | 基础方法 + **tombstone FIFO 全套**；`RemoveAt` / `InsertAt` 自带下标修正 |
+| `src/storage/index/b_plus_tree.cpp` | ✅ | `IsEmpty` / `GetValue` / `Insert` / `InsertIntoParent` / `Remove` / `Begin` / `Begin(key)` / `End` / `GetRootPageId`；**真 crabbing + Remove 乐观路径 + tombstone 全流程** |
+| `src/storage/index/index_iterator.cpp` | ✅ | 构造 / `IsEnd` / `operator*` / `operator++` + `AdvanceToNextVisible` + 补齐 `IsCurrentEntryDeleted` |
+
+## 框架文件的移植性修复（与作业逻辑无关，建议单独成 commit）
+
+| 文件 | 内容 |
+|---|---|
+| `src/include/common/util/string_util.h` | 补 `#include <cstdint>`（`uint64_t`） |
+| `src/include/primer/orset_driver.h` | 补 `#include <cstdint>`（`int64_t` / `uint32_t`） |
+
+>环境的工具链从 gcc-toolset-14 升到 15后，libstdc++ 15 收紧了传递包含，
+> `<string>` / `<vector>` / `<memory>` 不再顺带带出 `<cstdint>`。
+> 报错会级联成`out-of-line definition ... does not match any declaration`，容易误判。
+> 排错用 `ninja -k 0`（遇错继续）一次收齐全部根因，不要用默认的 fail-fast。
 
 ## 自行新增的辅助设施（非框架要求）
 
-| 名称 | 位置 | 作用 |
-|---|---|---|
-| `ArcReplacer::Dieout()` | `arc_replacer.h:91` | 收拢「淘汰一个 frame 到ghost 列表」的 5 步公共逻辑 |
-| `FrameStatus::it_` | `arc_replacer.h:37` | 缓存链表位置迭代器，让 `list::erase` 降到 O(1) |
-| `BPlusTree::InsertIntoParent()` | `b_plus_tree.cpp:491` | 递归处理分裂上推（新建根 / 父未满 / 父也分裂） |
-| `InternalPage::SetValueAt` / `RemoveAt` | `b_plus_tree_internal_page.cpp` | 分裂合并时单独改 child 指针 / 删槽位 |
-| `LeafPage::SetKeyValueAt` / `RemoveAt` | `b_plus_tree_leaf_page.cpp` | KV 成对写入 / 删除并左移 |
-| `IndexIterator::AdvanceToNextVisible()` | `index_iterator.cpp:67` | 统一处理跨页与 tombstone 跳过，保证迭代器不变式 |
+| 名称 | 作用 |
+|---|---|
+| `ArcReplacer::Dieout()` | 收拢「淘汰一个 frame 到ghost 列表」的 5 步公共逻辑 |
+| `FrameStatus::it_` | 缓存链表位置迭代器，让 `list::erase` 降到 O(1) |
+| `BPlusTree::ChildIndex()` | 内部页二分抽成一处（原来重复 5 遍） |
+| `BPlusTree::FindKeyInLeaf()` | 叶子二分 + 输出 `insert_pos`，查重/复活/插入/分裂共用 |
+| `BPlusTree::CrabDownToLeaf()` | 乐观路径的螃蟹式下降，返回叶子写锁 |
+| `BPlusTree::InsertIntoParent()` | 递归处理分裂上推（新建根 / 父未满 / 父也分裂） |
+| `BPlusTree::FlushTombstonesToFit()` | 合并后把超容量的 tombstone 兑现成物理删除 |
+| `InternalPage::SetValueAt` / `RemoveAt` | 分裂合并时单独改 child 指针 / 删槽位 |
+| `LeafPage::InsertAt` / `RemoveAt` | KV 移位并同步修正 tombstone 下标 |
+| `LeafPage` tombstone 接口 | `TombCapacity` / `GetNumTombstones` / `TombKeyIndexAt` / `IsTombstoned` / `AddTombstone` / `PopOldestTombstone` / `ClearTombstoneAt` / `ClearTombstones` / `SetTombstoneIndexes` |
+| `IndexIterator::AdvanceToNextVisible()` | 统一处理跨页与 tombstone 跳过，保证迭代器不变式 |
+| `build_support/verify_p1_p2.sh` | 一键编译 + 跑全部 P1/P2 测试（`--clean` / `p1` / `p2`） |
+
+---
+
+## 测试现状
+
+构建命令（**必须用 clang**，系统 gcc 没有 libasan）：
+
+```bash
+CC=clang CXX=clang++ cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug ..
+ninja -j $(nproc) build-tests
+```
+
+跑测试必须加 `--gtest_also_run_disabled_tests`（BusTub 用例默认带 `DISABLED_` 前缀）。
+
+| P1 | 结果 | | P2 | 结果 |
+|---|---|---|---|---|
+| `disk_manager_test` | 4/4 ✅ | | `b_plus_tree_insert_test` | 4/4 ✅ |
+| `disk_scheduler_test` | 1/1 ✅ | | `b_plus_tree_delete_test` | 3/3 ✅ |
+| `arc_replacer_test` | 2/2 ✅ | | `b_plus_tree_tombstone_test` | 4/4 ✅ |
+| `page_guard_test` | 2/2 ✅ | | `b_plus_tree_sequential_scale_test` | 1/1 ✅ |
+| `buffer_pool_manager_test` | 7/7 ✅ | | `b_plus_tree_concurrent_test` | 6/6 ✅ |
+| **小计** | **16/16** | | **小计** | **18/18** |
+
+并发测试耗时：`InsertTest1` 3s、`InsertTest2` 20s、`DeleteTest1/2` <1s、`MixTest1` 18s、`MixTest2` 5s。
+全程 AddressSanitizer 开启。`DeleteTest1`曾经 flaky，额外连跑 5 次确认稳定。
 
 ---
 
@@ -996,8 +1553,8 @@ auto operator++() { if (!IsEnd()) { index_++; AdvanceToNextVisible(); } return *
 - [ ] `ArcReplacer::Size()` 加 `latch_`
 - [ ] 修 `GetPinCount()` 中放锁后解引用迭代器的问题
 - [ ] `FrameStatus::it_` 的类型双关改为显式方案
-- [ ] 实现叶子页 tombstone 写入 + `Remove` 懒删除路径
-- [ ] 统一 `GetMinSize()` 与 `Remove()` 的最小尺寸口径
-- [ ] `GetRootPageId()` 改用 `ReadPage`
-- [ ] （可选）给 `Remove()` 加乐观路径，去掉 header 写锁的全局串行化
-- [ ] （可选）复核 `Insert` 乐观路径在并发分裂下的正确性
+- [ ] （性能）给 frame 加 `io_in_progress_` 标记 + 条件变量，把换页 IO 重新挪出 `bpm_latch_`
+- [ ] （性能/健壮性）悲观路径加「安全节点提前释放」，解决深树 pin 满abort
+- [ ] 处理 merge 后的二次 underflow（`容量 > min` 时才会触发）
+- [ ] 统一迭代器与借位的加锁方向，去掉对 header 写锁串行化的隐式依赖
+- [ ] （可选）`lru_k_replacer.cpp` —— 若评测要求 LRU-K 版本

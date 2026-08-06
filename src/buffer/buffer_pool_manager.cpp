@@ -269,8 +269,9 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     replacer_->RecordAccess(frame_id, page_id, access_type);
     replacer_->SetEvictable(frame_id, false);
 
-    // bpm_latch_->unlock(); // 释放锁，再做磁盘 IO
-    lk.unlock();
+    // 这里不能放锁：page_table_[page_id] 已经装好了，但 frame 里的数据还没读进来，
+    // 且此刻我们并不持有 frame->rwlatch_（guard 是 IO 之后才构造的）。
+    // 一旦放锁，别的线程命中 page_table_ 就能读到未初始化的内容。
     // 发起磁盘读请求，从磁盘读入页面数据
     auto promise = disk_scheduler_->CreatePromise(); // pomise 是后台线程做完某件事情后，通知前台线程的工具
     auto future = promise.get_future();
@@ -296,13 +297,27 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
 
   // if 被驱逐的页是脏页，需要先写回磁盘
   auto frame = frames_[frame_id];
+
+  /* ⚠️ 这一整段换页流程必须全程持有 bpm_latch_，不能像原来那样为了「IO 不占锁」中途放开。
+   * 原来的写法有两个竞态窗口，会直接丢数据：
+   *
+   * 窗口 1（脏页写回期间放锁）：此时 frame 已经被 Evict() 从 replacer 摘掉、pin_count 是 0，
+   *   但 page_table_ 里 old_page_id -> frame_id 的映射还在。别的线程请求 old_page_id 会命中
+   *   page_table_，拿到这个 frame 的 guard 并开始读写；我们回来后 frame->Reset() 把数据清零
+   *   并换成新页，对方的写入被静默丢弃。
+   *
+   * 窗口 2（读入新页前放锁）：page_table_[page_id] 已经装好，但 frame 里还是旧数据/全零，
+   *   而我们尚未持有 frame->rwlatch_（guard 是IO 之后才构造的）。别的线程命中 page_table_
+   *   后能直接读到未初始化的内容。
+   *
+   * 代价是换页这条慢路径被串行化；换来的是正确性。DiskScheduler 的后台线程不碰 bpm_latch_，
+   * 所以在锁内 future.get() 不会死锁。
+   */
   if(frame->is_dirty_) {
     // 找到旧的 page_id 
     auto old_page_id = frame->page_id_;
 
     frame->is_dirty_ = false; // 先清标记，防止并发重复写
-    // bpm_latch_->unlock(); // 释放锁再做 IO
-    lk.unlock();
 
     auto promise = disk_scheduler_->CreatePromise();
     auto future = promise.get_future();
@@ -312,15 +327,11 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
 
     disk_scheduler_->Schedule(requests);
     future.get(); // 等待写完成
-
-    // bpm_latch_->lock(); // 这里需要重新拿锁
-    lk.lock();
   }
   // 删除旧的 page_table_ 映射
   page_table_.erase(frame->page_id_);
 
   // 建立新的 page_table_ 映射
-  // auto frame
   frame->Reset();
   frame->page_id_ = page_id;
   page_table_[page_id] = frame_id;
@@ -329,9 +340,7 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   replacer_->RecordAccess(frame_id, page_id, access_type);
   replacer_->SetEvictable(frame_id, false);
 
-  // bpm_latch_->unlock();
-  lk.unlock();
-  // 从磁盘读入页面数据
+  // 从磁盘读入页面数据（仍在bpm_latch_ 保护下，保证别人看不到半成品的 frame）
   auto promise = disk_scheduler_->CreatePromise();
   auto future = promise.get_future();
   std::vector<DiskRequest> requests;
@@ -341,9 +350,6 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   future.get(); // 等待读完成
 
   return WritePageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
-  // }
-
-  // bpm_latch_->unlock();
 }
 
 /**
@@ -410,8 +416,7 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
     replacer_->RecordAccess(frame_id, page_id, access_type);
     replacer_->SetEvictable(frame_id, false);
 
-    // bpm_latch_->unlock(); // 释放锁，再做磁盘 IO
-    lk.unlock();
+    // 同上：读入完成前不能放锁，否则别的线程能看到 frame 里的半成品数据
     // 发起磁盘读请求，从磁盘读入页面数据
     auto promise = disk_scheduler_->CreatePromise(); // pomise 是后台线程做完某件事情后，通知前台线程的工具
     auto future = promise.get_future();
@@ -437,13 +442,14 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
 
   // if 被驱逐的页是脏页，需要先写回磁盘
   auto frame = frames_[frame_id];
+
+  // 与 CheckedWritePage 同理：换页全程不放bpm_latch_，避免「page_table_ 里还挂着旧映射」
+  // 和「frame 数据尚未读入就已可见」这两个窗口被别的线程钻进来
   if(frame->is_dirty_) {
     // 找到旧的 page_id 
     auto old_page_id = frame->page_id_;
 
     frame->is_dirty_ = false; // 先清标记，防止并发重复写
-    // bpm_latch_->unlock(); // 释放锁再做 IO
-    lk.unlock();
 
     auto promise = disk_scheduler_->CreatePromise();
     auto future = promise.get_future();
@@ -453,15 +459,11 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
 
     disk_scheduler_->Schedule(requests);
     future.get(); // 等待写完成
-
-    // bpm_latch_->lock(); // 这里需要重新拿锁
-    lk.lock();
   }
   // 删除旧的 page_table_ 映射
   page_table_.erase(frame->page_id_);
 
   // 建立新的 page_table_ 映射
-  // auto frame
   frame->Reset();
   frame->page_id_ = page_id;
   page_table_[page_id] = frame_id;
@@ -470,9 +472,7 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
   replacer_->RecordAccess(frame_id, page_id, access_type);
   replacer_->SetEvictable(frame_id, false);
 
-  // bpm_latch_->unlock();
-  lk.unlock();
-  // 从磁盘读入页面数据
+  // 从磁盘读入页面数据（仍在bpm_latch_ 保护下）
   auto promise = disk_scheduler_->CreatePromise();
   auto future = promise.get_future();
   std::vector<DiskRequest> requests;
@@ -482,9 +482,6 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
   future.get(); // 等待读完成
 
   return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
-  // }
-
-  // bpm_latch_->unlock();
 }
 
 /**

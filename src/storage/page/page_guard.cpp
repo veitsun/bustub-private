@@ -165,24 +165,33 @@ void ReadPageGuard::Flush() {
  * TODO(P1): Add implementation.
  */
 void ReadPageGuard::Drop() {
-  // UNIMPLEMENTED("TODO(P1): Add implementation.");
   if (!is_valid_) {
     // 防止 double free
     return ;
   }
   is_valid_ = false;
 
-  // 释放页面锁
-  page_lock_.unlock();
-
-  // 将 frame 的 pin_count 减 1 ， 并在 pin_count 降为 0 时。通知 replacer 该 frame 可以被淘汰
+  /* 顺序很关键：必须在「仍持有页面锁」的状态下，先拿 bpm_latch_ 把 pin_count 减掉，
+   * 最后才放开页面锁。
+   *
+   * 如果像原来那样先放页面锁再减 pin_count，会留下一个窗口：
+   * 别的线程可以立刻抢到页面锁并认为自己独占了这一页，但此时 pin_count 还没减，
+   * 于是它调用 DeletePage() 会因为 pin_count > 0 而失败
+   * （表现为Remove() 里 "failed to delete merged leaf" 断言随机崩）。
+   *
+   * 反过来会不会死锁？不会。BPM 里唯一「持bpm_latch_ 再去拿页面锁」的地方是
+   * CheckedRead/WritePage 的 Case B/C，而那两处的 frame 分别来自 free_frames_ 和
+   * Evict()（要求 pin_count == 0），配合本函数的新顺序，pin_count == 0 蕴含页面锁已经放掉，
+   * 所以那里绝不会真的阻塞在页面锁上，构不成环。
+   */
   {
-    // 先释放页面锁， 再拿 bpm_latch 修改 pin_count ，顺序反了会死锁
     std::lock_guard<std::mutex> lk(*bpm_latch_);
     frame_->pin_count_ --;
     if(frame_->pin_count_ == 0) {
       replacer_->SetEvictable(frame_->frame_id_, true);
     }
+    // 仍在 bpm_latch_ 保护下释放页面锁，保证「拿到页面锁」蕴含「前一个持有者的 pin 已归还」
+    page_lock_.unlock();
   }
 }
 
@@ -353,24 +362,21 @@ void WritePageGuard::Flush() {
  * TODO(P1): Add implementation.
  */
 void WritePageGuard::Drop() {
-  // UNIMPLEMENTED("TODO(P1): Add implementation.");
     if (!is_valid_) {
     // 防止 double free
     return ;
   }
   is_valid_ = false;
 
-  // 释放页面锁
-  page_lock_.unlock();
-
-  // 将 frame 的 pin_count 减 1 ， 并在 pin_count 降为 0 时。通知 replacer 该 frame 可以被淘汰
+  // 与 ReadPageGuard::Drop同理：先在持有页面锁的前提下归还 pin_count，最后才放页面锁。
+  // 这样「谁拿到页面锁，谁就看到 pin_count 已经是干净的」，DeletePage() 才不会误判。
   {
-    // 先释放页面锁， 再拿 bpm_latch 修改 pin_count ，顺序反了会死锁
     std::lock_guard<std::mutex> lk(*bpm_latch_);
     frame_->pin_count_ --;
     if(frame_->pin_count_ == 0) {
       replacer_->SetEvictable(frame_->frame_id_, true);
     }
+    page_lock_.unlock();
   }
 }
 
