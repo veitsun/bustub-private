@@ -75,7 +75,9 @@ class Context {
 FULL_INDEX_TEMPLATE_ARGUMENTS_DEFN
 class BPlusTree {
   using InternalPage = BPlusTreeInternalPage<KeyType, page_id_t, KeyComparator>;
-  using LeafPage = BPlusTreeLeafPage<KeyType, ValueType, KeyComparator>;
+  // 注意：NumTombs 必须一路传下去，否则叶子页会退化成 0 个 tombstone 槽的布局，
+  // 与测试 / IndexIterator 使用的布局不一致（它们是带 NumTombs 的）。
+  using LeafPage = BPlusTreeLeafPage<KeyType, ValueType, KeyComparator, NumTombs>;
 
  public:
   explicit BPlusTree(std::string name, page_id_t header_page_id, BufferPoolManager *buffer_pool_manager,
@@ -132,6 +134,15 @@ class BPlusTree {
   auto ToPrintableBPlusTree(page_id_t root_id) -> PrintableBPlusTree;
 
   // auto LookUpLeafPage(page_id_t page_id, Context &ctx) -> BPlusTreeLeafPage<KeyType, ValueType, KeyComparator>&;
+
+  // 在叶子页内二分查找 key。命中返回其下标，未命中返回 -1。
+  // insert_pos 输出「若要插入该key，应该放在哪个下标」（命中时等于命中下标）。
+  auto FindKeyInLeaf(const LeafPage *leaf, const KeyType &key, int *insert_pos) const -> int;
+
+  // 合并两页之后 tombstone 可能超出固定容量。按FIFO 从最老的开始物理删除对应 entry，
+  // 直到剩余数量能装进tombstone 缓冲区，最后把结果写回页面。
+  // tombs 传入的是「合并后」的 tombstone 下标列表（相对 page 的 key_array_）。
+  static void FlushTombstonesToFit(LeafPage *page, std::vector<size_t> &tombs);
 
   // member variable
   std::string index_name_;      // 这个索引的名字

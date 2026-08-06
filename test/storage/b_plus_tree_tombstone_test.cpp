@@ -15,7 +15,7 @@ namespace bustub {
 
 using bustub::DiskManagerUnlimitedMemory;
 
-TEST(BPlusTreeTests, DISABLED_TombstoneBasicTest) {
+TEST(BPlusTreeTests, TombstoneBasicTest) {
   auto key_schema = ParseCreateStatement("a bigint");
   GenericComparator<8> comparator(key_schema.get());
 
@@ -155,7 +155,7 @@ TEST(BPlusTreeTests, DISABLED_TombstoneBasicTest) {
   delete disk_manager;
 }
 
-TEST(BPlusTreeTests, DISABLED_TombstoneSplitTest) {
+TEST(BPlusTreeTests, TombstoneSplitTest) {
   auto key_schema = ParseCreateStatement("a bigint");
   GenericComparator<8> comparator(key_schema.get());
 
@@ -217,7 +217,7 @@ TEST(BPlusTreeTests, DISABLED_TombstoneSplitTest) {
   delete disk_manager;
 }
 
-TEST(BPlusTreeTests, DISABLED_TombstoneBorrowTest) {
+TEST(BPlusTreeTests, TombstoneBorrowTest) {
   using LeafPage = BPlusTreeLeafPage<GenericKey<8>, RID, GenericComparator<8>, 1>;
   auto key_schema = ParseCreateStatement("a bigint");
   GenericComparator<8> comparator(key_schema.get());
@@ -278,7 +278,7 @@ TEST(BPlusTreeTests, DISABLED_TombstoneBorrowTest) {
   delete disk_manager;
 }
 
-TEST(BPlusTreeTests, DISABLED_TombstoneCoalesceTest) {
+TEST(BPlusTreeTests, TombstoneCoalesceTest) {
   using LeafPage = BPlusTreeLeafPage<GenericKey<8>, RID, GenericComparator<8>, 2>;
   auto key_schema = ParseCreateStatement("a bigint");
   GenericComparator<8> comparator(key_schema.get());

@@ -105,6 +105,16 @@ auto B_PLUS_TREE_LEAF_PAGE_TYPE::ValueAtRef(int index) const -> const ValueType 
 
 FULL_INDEX_TEMPLATE_ARGUMENTS
 void B_PLUS_TREE_LEAF_PAGE_TYPE::RemoveAt(int index) {
+  // 物理删除一个 entry。必须先修正 tombstone 记账，再搬 entry：
+  // 1) 指向 index 本身的 tombstone 记录要删掉（这个 entry 都不存在了）
+  // 2) 指向 index 之后的 tombstone 下标要整体左移一格
+  ClearTombstoneAt(index);
+  for(size_t i = 0; i < num_tombstones_; i ++) {
+    if(static_cast<int>(tombstones_[i]) > index) {
+      tombstones_[i] --;
+    }
+  }
+
   for(int i = index; i < GetSize() - 1; i ++) {
     key_array_[i] = key_array_[i + 1];
     rid_array_[i] = rid_array_[i + 1];
@@ -116,6 +126,103 @@ FULL_INDEX_TEMPLATE_ARGUMENTS
 void B_PLUS_TREE_LEAF_PAGE_TYPE::SetKeyValueAt(int index, const KeyType &key,  const ValueType &value) {
   key_array_[index] = key;
   rid_array_[index] = value;
+}
+
+/*****************************************************************************
+ * TOMBSTONE（懒删除）
+ *****************************************************************************/
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::GetNumTombstones() const -> size_t { return num_tombstones_; }
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::TombKeyIndexAt(size_t tomb_pos) const -> size_t {
+  BUSTUB_ASSERT(tomb_pos < num_tombstones_, "tombstone position out of range");
+  return tombstones_[tomb_pos];
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::IsTombstoned(int index) const -> bool {
+  for(size_t i = 0; i < num_tombstones_; i ++) {
+    if(static_cast<int>(tombstones_[i]) == index) {
+      return true;
+    }
+  }
+  return false;
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::AddTombstone(int index) -> bool {
+  // 容量为 0 时 num_tombstones_(0) >= 0 成立，直接返回 false，
+  // 顺带避免了对零长数组 tombstones_[0] 的越界写
+  if(num_tombstones_ >= TombCapacity()) {
+    return false;
+  }
+  tombstones_[num_tombstones_] = static_cast<size_t>(index);
+  num_tombstones_ ++;
+  return true;
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::PopOldestTombstone() -> int {
+  if(num_tombstones_ == 0) {
+    return -1;
+  }
+  int oldest = static_cast<int>(tombstones_[0]);
+  for(size_t i = 1; i < num_tombstones_; i ++) {
+    tombstones_[i - 1] = tombstones_[i];
+  }
+  num_tombstones_ --;
+  return oldest;
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto B_PLUS_TREE_LEAF_PAGE_TYPE::ClearTombstoneAt(int index) -> bool {
+  for(size_t i = 0; i < num_tombstones_; i ++) {
+    if(static_cast<int>(tombstones_[i]) == index) {
+      // 保持 FIFO 相对顺序：把后面的整体前移一格
+      for(size_t j = i + 1; j < num_tombstones_; j ++) {
+        tombstones_[j - 1] = tombstones_[j];
+      }
+      num_tombstones_ --;
+      return true;
+    }
+  }
+  return false;
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_LEAF_PAGE_TYPE::ClearTombstones() { num_tombstones_ = 0; }
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_LEAF_PAGE_TYPE::SetTombstoneIndexes(const std::vector<size_t> &indexes) {
+  num_tombstones_ = 0;
+  for(auto idx : indexes) {
+    if(num_tombstones_ >= TombCapacity()) {
+      break;
+    }
+    BUSTUB_ASSERT(static_cast<int>(idx) < GetSize(), "tombstone index out of range");
+    tombstones_[num_tombstones_] = idx;
+    num_tombstones_ ++;
+  }
+}
+
+FULL_INDEX_TEMPLATE_ARGUMENTS
+void B_PLUS_TREE_LEAF_PAGE_TYPE::InsertAt(int index, const KeyType &key, const ValueType &value) {
+  // 从后往前腾出index 这个位置
+  for(int i = GetSize(); i > index; i --) {
+    key_array_[i] = key_array_[i - 1];
+    rid_array_[i] = rid_array_[i - 1];
+  }
+  // 被右移的 entry，其 tombstone 下标要同步 +1
+  for(size_t i = 0; i < num_tombstones_; i ++) {
+    if(static_cast<int>(tombstones_[i]) >= index) {
+      tombstones_[i] ++;
+    }
+  }
+  key_array_[index] = key;
+  rid_array_[index] = value;
+  ChangeSizeBy(1);
 }
 
 template class BPlusTreeLeafPage<GenericKey<4>, RID, GenericComparator<4>>;

@@ -92,33 +92,15 @@ auto BPLUSTREE_TYPE::GetValue(const KeyType &key, std::vector<ValueType> *result
       // 如果是叶子节点的话
       auto leaf = guard.As<LeafPage>();
       // 下面是二分找 key 的过程
-      int left = 0;
-      int right = leaf->GetSize() - 1;
-      int found = -1;
-      while (left <= right) {
-        int mid = left + (right - left) / 2;
-        int cmp = comparator_(leaf->KeyAt(mid), key);
-        if(cmp == 0) {
-          found = mid;
-          break;
-        }
-        else if(cmp < 0) {
-          left = mid + 1;
-        }
-        else {
-          right = mid - 1;
-        }
-      }
+      int insert_pos = 0;
+      int found = FindKeyInLeaf(leaf, key, &insert_pos);
       if(found == -1) {
         return false;
       }
 
-      // 检查是否在 tombstone 中
-      auto tombs = leaf->GetTombstones();
-      for(const auto &tomb_key : tombs) {
-        if(comparator_(tomb_key, key) == 0) {
-          return false;
-        }
+      // 命中了，但可能已经被 tombstone 逻辑删除 —— 对外应表现为「不存在」
+      if(leaf->IsTombstoned(found)) {
+        return false;
       }
 
       result->push_back(leaf->ValueAt(found));
@@ -206,6 +188,9 @@ auto BPLUSTREE_TYPE::Insert(const KeyType &key, const ValueType &value) -> bool 
       header_w_page->root_page_id_ = new_page_id;
       return true;
     }
+    // 双重检查失败：说明别的线程刚刚建好了根。
+    // 必须把本地的 root_page_id 刷新成真实值，否则下面会拿 INVALID_PAGE_ID 去 ReadPage。
+    root_page_id = header_w_page->root_page_id_;
   }
 
 
@@ -219,12 +204,10 @@ auto BPLUSTREE_TYPE::Insert(const KeyType &key, const ValueType &value) -> bool 
     auto guard = bpm_->ReadPage(current_page_id);
     auto page = guard.As<BPlusTreePage>();
     if(page->IsLeafPage()) {
-      // 那么就看看能不能插入了
-      auto leaf = guard.As<LeafPage>();
-      if(leaf->GetSize() < leaf_max_size_) {
-        target_leaf_page_id = current_page_id;
-      }
-      
+      // 乐观路径：无论叶子满不满都先记下页号。
+      // 因为「key 已存在（含tombstone 复活）」这种情况即使页满也不需要分裂，
+      // 只有「key 不存在 且 页满」才必须退化到悲观路径。
+      target_leaf_page_id = current_page_id;
       break;
     }
     // page_id_stack.push_back(current_page_id);
@@ -261,43 +244,27 @@ auto BPLUSTREE_TYPE::Insert(const KeyType &key, const ValueType &value) -> bool 
     auto leaf_guard = bpm_->WritePage(target_leaf_page_id);
     auto leaf = leaf_guard.AsMut<LeafPage>();
 
-    // if(leaf->GetSize() < leaf_max_size_) {
-    //   // 这里做 “未满 leaf 插入”
-    //   // 成功返回 return true， 重复键 return false
-    // }
+    int insert_pos = 0;
+    int found = FindKeyInLeaf(leaf, key, &insert_pos);
+
+    if(found >= 0) {
+      // key 的槽位还在页里
+      if(leaf->IsTombstoned(found)) {
+        // 之前是被逻辑删除的 —— 这次插入相当于「复活」：撤掉 tombstone 并覆盖 value
+        leaf->ClearTombstoneAt(found);
+        leaf->SetKeyValueAt(found, key, value);
+        return true;
+      }
+      // 真正的重复键
+      return false;
+    }
+
     if(leaf->GetSize() < leaf_max_size_) {
-      // 在 key_array_ 中找到插入位置（二分），检查是否重复 key -> 返回 false
-      int insert_pos = leaf->GetSize();
-      int left = 0;
-      int right = leaf->GetSize() - 1;
-
-      while(left <= right) {
-        int mid = left + (right - left) / 2;
-        int cmp = comparator_(leaf->KeyAt(mid), key);
-        if(cmp == 0) {
-          return false;
-        }
-        if(cmp < 0) {
-          // insert_pos = mid;
-          left = mid + 1;
-        }
-        else {
-          insert_pos = mid;
-          right = mid - 1;
-        }
-
-      }
-
-      // insert_idx 就是他要插入的位置
-      // 后移腾出位置
-      for(int i = leaf->GetSize(); i > insert_pos; i--) {
-        leaf->SetKeyValueAt(i, leaf->KeyAt(i-1), leaf->ValueAt(i - 1));
-      }
-      leaf->SetKeyValueAt(insert_pos, key, value);
-      leaf->ChangeSizeBy(1);
+      // 未满，直接插入（InsertAt 内部会同步修正 tombstone 下标）
+      leaf->InsertAt(insert_pos, key, value);
       return true;
     }
-    
+    // 走到这里：key 不存在 且 叶子已满 → 需要分裂，落到下面的悲观路径
   }
 
   // 如果 optimistic path 发现 leaf 满了，才进入慢路径
@@ -351,38 +318,24 @@ auto BPLUSTREE_TYPE::Insert(const KeyType &key, const ValueType &value) -> bool 
 
 
 
-if(leaf->GetSize() < leaf_max_size_) {
-  // 在 key_array_ 中找到插入位置（二分），检查是否重复 key -> 返回 false
-  int insert_pos = leaf->GetSize();
-  int left = 0;
-  int right = leaf->GetSize() - 1;
+  //悲观路径下重新做一次判定（乐观路径的探测与加锁之间状态可能已变）
+  int insert_pos = 0;
+  int found = FindKeyInLeaf(leaf, key, &insert_pos);
 
-  while(left <= right) {
-    int mid = left + (right - left) / 2;
-    int cmp = comparator_(leaf->KeyAt(mid), key);
-    if(cmp == 0) {
-      return false;
+  if(found >= 0) {
+    if(leaf->IsTombstoned(found)) {
+      // tombstone 复活
+      leaf->ClearTombstoneAt(found);
+      leaf->SetKeyValueAt(found, key, value);
+      return true;
     }
-    if(cmp < 0) {
-      // insert_pos = mid;
-      left = mid + 1;
-    }
-    else {
-      insert_pos = mid;
-      right = mid - 1;
-    }
-
+    return false;
   }
 
-  // insert_idx 就是他要插入的位置
-  // 后移腾出位置
-  for(int i = leaf->GetSize(); i > insert_pos; i--) {
-    leaf->SetKeyValueAt(i, leaf->KeyAt(i-1), leaf->ValueAt(i - 1));
+  if(leaf->GetSize() < leaf_max_size_) {
+    leaf->InsertAt(insert_pos, key, value);
+    return true;
   }
-  leaf->SetKeyValueAt(insert_pos, key, value);
-  leaf->ChangeSizeBy(1);
-  return true;
-}
 
 
   // 叶子已经满的时候需要分裂
@@ -394,7 +347,8 @@ if(leaf->GetSize() < leaf_max_size_) {
     2. 从 buffer pool 申请一个新叶子页，Init()
     3. 前半部分留在原叶子，后半部分移到新叶子
     4. 更新链表指针：new_leaf->next = old_leaf->next，old_leaf->next = new_page_id
-    5. 把新叶子的第一个 key 和 new_page_id 上推到父节点（这一步会递归触发内部节点的分裂）
+    5. tombstone 按key 落到哪一页分派过去，且保持 FIFO 相对顺序
+    6. 把新叶子的第一个 key 和 new_page_id 上推到父节点（这一步会递归触发内部节点的分裂）
    */
 
   
@@ -411,29 +365,30 @@ if(leaf->GetSize() < leaf_max_size_) {
   int split = total / 2;
 
   // 我需要一个临时数组存放所有 max_size + 1 个 KV （按 key 插入新 Key）
-  // KeyType tmp_key_array[total];
-  // ValueType tmp_value_array[total];
   std::vector<KeyType> tmp_key_array(total);
   std::vector<ValueType> tmp_value_array(total);
-  // 找这个新 kv 要插入新数组的位置，用二分找
-  // 先二分找新 key 在原叶子中的插入位置
-  int new_insert_pos = leaf->GetSize();
-  int left = 0;
-  int right = leaf->GetSize() - 1;
-  while(left <= right) {
-    int mid = left + (right - left) / 2;
-    int cmp = comparator_(leaf->KeyAt(mid), key);
-    if(cmp < 0) {
-      left = mid + 1;
+  // 新 key 的插入位置已经由上面的FindKeyInLeaf 算出来了，直接复用
+  int new_insert_pos = insert_pos;
+
+  // ── tombstone 随分裂一起搬迁 ──
+  // 先把旧叶子的 tombstone 下标翻译成 tmp 数组的下标：
+  // 新 key 插在 new_insert_pos，位于它及其之后的旧条目在 tmp 里都要+1。
+  // 然后按 split 切成左右两份，遍历顺序即 FIFO 顺序，所以相对新旧关系天然保留。
+  std::vector<size_t> left_tombs;
+  std::vector<size_t> right_tombs;
+  for(size_t i = 0; i < leaf->GetNumTombstones(); i ++) {
+    size_t t = leaf->TombKeyIndexAt(i);
+    if(t >= static_cast<size_t>(new_insert_pos)) {
+      t ++;
     }
-    else if(cmp == 0) {
-      return false;
+    if(t < static_cast<size_t>(split)) {
+      left_tombs.push_back(t);
     }
     else {
-      new_insert_pos = mid;
-      right = mid - 1;
+      right_tombs.push_back(t - split);
     }
   }
+
   // 分三阶段填入临时数组
 
   for(int i = 0; i < new_insert_pos; i ++) {
@@ -446,8 +401,6 @@ if(leaf->GetSize() < leaf_max_size_) {
     tmp_key_array[i + 1] = leaf->KeyAt(i);
     tmp_value_array[i + 1] = leaf->ValueAt(i);
   }
-  // leaf->KeyAt(i);
-  // leaf->ValueAt(i);
 
   // 原叶子截断到 split 个
   for(int i = 0; i < split; i ++) {
@@ -460,6 +413,10 @@ if(leaf->GetSize() < leaf_max_size_) {
     new_leaf->SetKeyValueAt(i - split, tmp_key_array[i], tmp_value_array[i]);
   }
   new_leaf->SetSize(total - split);
+
+  // entry 都搬完、size 也定下来之后再写 tombstone（SetTombstoneIndexes 内部会断言下标合法）
+  leaf->SetTombstoneIndexes(left_tombs);
+  new_leaf->SetTombstoneIndexes(right_tombs);
 
   // 更新链表
   new_leaf->SetNextPageId(leaf->GetNextPageId());
@@ -609,6 +566,64 @@ void BPLUSTREE_TYPE::InsertIntoParent(page_id_t old_page_id, const KeyType &push
 
 
 /*****************************************************************************
+ * HELPERS
+ *****************************************************************************/
+/**
+ * @brief 在叶子页内二分查找 key。
+ * @param[out] insert_pos 未命中时输出「应插入的下标」；命中时等于命中下标
+ * @return 命中下标，未命中返回 -1
+ */
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto BPLUSTREE_TYPE::FindKeyInLeaf(const LeafPage *leaf, const KeyType &key, int *insert_pos) const -> int {
+  int left = 0;
+  int right = leaf->GetSize() - 1;
+  int pos = leaf->GetSize();
+  while(left <= right) {
+    int mid = left + (right - left) / 2;
+    int cmp = comparator_(leaf->KeyAt(mid), key);
+    if(cmp == 0) {
+      *insert_pos = mid;
+      return mid;
+    }
+    if(cmp < 0) {
+      left = mid + 1;
+    }
+    else {
+      pos = mid;
+      right = mid - 1;
+    }
+  }
+  *insert_pos = pos;
+  return -1;
+}
+
+/**
+ * @brief 两页合并之后，tombstone 数量可能超过固定容量，必须把多出来的「兑现」成物理删除。
+ *
+ * 策略：FIFO —— 从最老的一条开始物理删除它指向的 entry，直到剩余数量能装进缓冲区。
+ * 实现上先ClearTombstones() 把页内记账清空，这样 RemoveAt() 只会搬 entry 不会干扰
+ * 我们手上这份 tombs 列表，下标修正由本函数统一负责。
+ */
+FULL_INDEX_TEMPLATE_ARGUMENTS
+void BPLUSTREE_TYPE::FlushTombstonesToFit(LeafPage *page, std::vector<size_t> &tombs) {
+  page->ClearTombstones();
+
+  while(tombs.size() > LeafPage::TombCapacity()) {
+    size_t victim = tombs.front();
+    tombs.erase(tombs.begin());
+    page->RemoveAt(static_cast<int>(victim));
+    // 被删掉的 entry 之后的下标整体左移一格
+    for(auto &t : tombs) {
+      if(t > victim) {
+        t --;
+      }
+    }
+  }
+
+  page->SetTombstoneIndexes(tombs);
+}
+
+/*****************************************************************************
  * REMOVE
  *****************************************************************************/
 /**
@@ -673,39 +688,42 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
   }
 
   // 二分查找 key
-  int lo = 0;
-  int hi = leaf->GetSize() - 1;
-  int found = -1;
-  while(lo <= hi) {
-    int mid = lo + (hi - lo) / 2;
-    int cmp = comparator_(leaf->KeyAt(mid), key);
-    if(cmp == 0) {
-      found = mid;
-      break;
-    }
-    else if(cmp < 0) {
-      lo = mid + 1;
-    }
-    else {
-      hi = mid - 1;
-    }
-  }
+  int insert_pos = 0;
+  int found = FindKeyInLeaf(leaf, key, &insert_pos);
   if(found == -1) {
     return ;
   }
 
-  // 检查查找到的是否已经 tombstoned
-  for(const auto &tk : leaf->GetTombstones()) {
-    if(comparator_(tk, key) == 0) {
+  // 检查查找到的是否已经 tombstoned —— 已经逻辑删除过了，直接返回
+  if(leaf->IsTombstoned(found)) {
+    return ;
+  }
+
+  /* ── tombstone 懒删除 ──
+   * 优先只打标记，不动物理结构：
+   *   a) 缓冲区还有空位→ 纯逻辑删除，size 不变，绝不会 underflow，直接返回
+   *   b) 缓冲区已满      → 淘汰最老的一条，把它「兑现」成物理删除腾出位置，
+   *                        再把当前 key 记为新的 tombstone。此时 size 减 1，
+   *                        才有可能 underflow，需要继续走下面的借位/合并流程
+   *   c) 容量为 0        → 退化成原来的纯物理删除
+   */
+  if(LeafPage::TombCapacity() > 0) {
+    if(leaf->GetNumTombstones() < LeafPage::TombCapacity()) {
+      leaf->AddTombstone(found);
       return ;
     }
+    int victim = leaf->PopOldestTombstone();
+    leaf->RemoveAt(victim);
+    // 物理删除会让victim 之后的下标左移，found 也要跟着修正
+    if(found > victim) {
+      found --;
+    }
+    leaf->AddTombstone(found);
   }
-  
-  // 优先 tombstone 懒删除，先不管这个
-  
-
-  // 物理删除
-  leaf->RemoveAt(found);
+  else {
+    // 物理删除
+    leaf->RemoveAt(found);
+  }
 
   // 叶子是根， 允许为空 （树变空时， 更新 header）
   if(ctx.write_set_.empty()) {
@@ -719,7 +737,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
   }
 
   // 处理 underflow
-  int leaf_min = (leaf_max_size_ + 1) / 2;
+  int leaf_min = leaf->GetMinSize();
   if(leaf->GetSize() >= leaf_min) {
     return ;
   }
@@ -730,18 +748,17 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
   int idx = parent->ValueIndex(leaf_page_id);
 
   // 尝试从左兄弟借
+  // 注意：只借「可见」的 entry。如果待借的那条本身是 tombstone，借过来对缓解
+  // underflow 毫无帮助（它依然不可见），还会把 tombstone 记账跨页搬运搞复杂，
+  // 所以这种情况直接放弃借位、走下面的合并分支。
   if(idx > 0) {
     auto left_guard = bpm_->WritePage(parent->ValueAt(idx -1));
     auto left_sib = left_guard.template AsMut<LeafPage>();
-    if(left_sib->GetSize() > leaf_min) {
+    int last = left_sib->GetSize() - 1;
+    if(left_sib->GetSize() > leaf_min && !left_sib->IsTombstoned(last)) {
       // 把左兄弟的最后一个 kv 移到当前叶子的最前面
-      int last = left_sib->GetSize() - 1;
-      for(int i = leaf->GetSize(); i > 0 ; i --) {
-        leaf->SetKeyValueAt(i, leaf->KeyAt(i - 1), leaf->ValueAt(i  - 1));
-      }
-      leaf->SetKeyValueAt(0, left_sib->KeyAt(last), left_sib->ValueAt(last));
-      leaf->ChangeSizeBy(1);
-      left_sib->ChangeSizeBy(-1);
+      leaf->InsertAt(0, left_sib->KeyAt(last), left_sib->ValueAt(last));
+      left_sib->RemoveAt(last);
       parent->SetKeyAt(idx, leaf->KeyAt(0)); // 更新分割 key
       return ;
     }
@@ -751,11 +768,9 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
   if(idx < parent->GetSize() - 1) {
     auto right_guard = bpm_->WritePage(parent->ValueAt(idx + 1));
     auto right_sib  = right_guard.template AsMut<LeafPage>();
-    if(right_sib->GetSize() > leaf_min) {
+    if(right_sib->GetSize() > leaf_min && !right_sib->IsTombstoned(0)) {
       // 把右兄弟第一个 kv 移到当前叶子的后面
-      leaf->SetKeyValueAt(leaf->GetSize(), right_sib->KeyAt(0), right_sib->ValueAt(0));
-      leaf->ChangeSizeBy(1);
-      // right_sib->ChangeSizeBy(-1);
+      leaf->InsertAt(leaf->GetSize(), right_sib->KeyAt(0), right_sib->ValueAt(0));
       right_sib->RemoveAt(0);
       parent->SetKeyAt(idx + 1, right_sib->KeyAt(0));
       return ;
@@ -767,13 +782,27 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
     // 把当前叶子合并进左兄弟
     auto left_guard = bpm_->WritePage(parent->ValueAt(idx - 1));
     auto left_sib = left_guard.template AsMut<LeafPage>();
+
+    // 合并后的 tombstone FIFO = 目标页自己的（较老，排前面）+ 被吸收页的（下标平移 base）
+    int base = left_sib->GetSize();
+    std::vector<size_t> merged;
+    for(size_t i = 0; i < left_sib->GetNumTombstones(); i ++) {
+      merged.push_back(left_sib->TombKeyIndexAt(i));
+    }
+    for(size_t i = 0; i < leaf->GetNumTombstones(); i ++) {
+      merged.push_back(leaf->TombKeyIndexAt(i) + static_cast<size_t>(base));
+    }
+
     for(int i = 0; i < leaf->GetSize(); i ++) {
-      left_sib->SetKeyValueAt(left_sib->GetSize() + i, leaf->KeyAt(i), leaf->ValueAt(i));
+      left_sib->SetKeyValueAt(base + i, leaf->KeyAt(i), leaf->ValueAt(i));
     }
 
     left_sib->ChangeSizeBy(leaf->GetSize());
 
     left_sib->SetNextPageId(leaf->GetNextPageId());
+
+    // 两页的 tombstone 加起来可能超容量，超出的部分兑现成物理删除
+    FlushTombstonesToFit(left_sib, merged);
 
     // 从父节点删除 idx 处 的 key 和 value （即  leaf_page_id 对应的槽）
     parent->RemoveAt(idx);
@@ -785,19 +814,29 @@ void BPLUSTREE_TYPE::Remove(const KeyType &key) {
 
     // 这里被删除的是右兄弟，不是当前叶子，先记住页号，再删
     page_id_t right_page_id = parent->ValueAt(idx + 1);
+    std::vector<size_t> merged;
     {
       // 与右兄弟合并（把右兄弟合并进当前叶子）
       auto right_guard = bpm_->WritePage(right_page_id);
       auto right_sib = right_guard.template AsMut<LeafPage>();
 
+      int base = leaf->GetSize();
+      for(size_t i = 0; i < leaf->GetNumTombstones(); i ++) {
+        merged.push_back(leaf->TombKeyIndexAt(i));
+      }
+      for(size_t i = 0; i < right_sib->GetNumTombstones(); i ++) {
+        merged.push_back(right_sib->TombKeyIndexAt(i) + static_cast<size_t>(base));
+      }
+
       for(int i = 0; i < right_sib->GetSize(); i ++) {
-        leaf->SetKeyValueAt(leaf->GetSize() + i, right_sib->KeyAt(i), right_sib->ValueAt(i));
+        leaf->SetKeyValueAt(base + i, right_sib->KeyAt(i), right_sib->ValueAt(i));
       }
       leaf->ChangeSizeBy(right_sib->GetSize());
       leaf->SetNextPageId(right_sib->GetNextPageId());
       parent->RemoveAt(idx + 1);
       right_guard.Drop();
     }
+    FlushTombstonesToFit(leaf, merged);
     auto ok = bpm_->DeletePage(right_page_id);
     BUSTUB_ASSERT(ok, "failed to delete merged right leaf");
 
@@ -1056,9 +1095,9 @@ auto BPLUSTREE_TYPE::End() -> INDEXITERATOR_TYPE {
  */
 FULL_INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::GetRootPageId() -> page_id_t {
-  // UNIMPLEMENTED("TODO(P2): Add implementation.");
-  auto guard = bpm_->WritePage(header_page_id_);
-  auto header_page = guard.AsMut<BPlusTreeHeaderPage>();
+  // 只是读一个字段，用读锁就够了（原来用 WritePage 会白拿排他锁，把并发读全串行化）
+  auto guard = bpm_->ReadPage(header_page_id_);
+  auto header_page = guard.As<BPlusTreeHeaderPage>();
   return header_page->root_page_id_;
 
 }

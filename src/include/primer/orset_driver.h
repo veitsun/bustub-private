@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstdint>  // GCC 15 / libstdc++ 15 起<memory>/<vector> 不再传递包含它，uint32_t / int64_t 需显式引入
 #include <memory>
 #include <vector>
 #include "primer/orset.h"

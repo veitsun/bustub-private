@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstdint>  // GCC 15 / libstdc++ 15 起 <string> 不再传递包含它，uint64_t 需显式引入
 #include <string>
 #include <vector>
 

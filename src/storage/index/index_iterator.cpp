@@ -62,6 +62,14 @@ auto INDEXITERATOR_TYPE::operator++() -> INDEXITERATOR_TYPE & {
   return *this;
 }
 
+// 判断迭代器当前停留的这个 entry 是否已被 tombstone 逻辑删除。
+//直接按「下标」比对，不做 key 比较：tombstones_ 里存的本来就是 key_array_ 的下标，
+// 这样既省掉 comparator 调用，也不依赖 key 的唯一性。
+FULL_INDEX_TEMPLATE_ARGUMENTS
+auto INDEXITERATOR_TYPE::IsCurrentEntryDeleted(const LeafPage *leaf) -> bool {
+  return leaf->IsTombstoned(index_);
+}
+
 // 把当前迭代器状态推进到“下一个合法可见的 entry”， 如果后面已经没有可见元素了，就把自己变成 End() 
 FULL_INDEX_TEMPLATE_ARGUMENTS
 void INDEXITERATOR_TYPE::AdvanceToNextVisible() {
@@ -99,21 +107,8 @@ void INDEXITERATOR_TYPE::AdvanceToNextVisible() {
     }
 
     // 当前 index_ 还在当前页范围内，但这个位置上的 key 可能已经被 tombstone 逻辑删除了
-    KeyType current_key = leaf->KeyAt(index_);
-    bool deleted = false;
-
-    // 遍历当前叶子页记录的 tombstone key
-    // 只要发现当前 key 在 tombstone 中，就说明这个 entry 对迭代器来说不可见
-
-    for(const auto &tomb_key : leaf->GetTombstones()) {
-      if(comparator_(tomb_key, current_key) == 0) {
-        deleted = true;
-        break;
-      }
-    }
-
     // 如果当前 entry 已经被逻辑删除，就跳过它， 继续检查下一个位置
-    if(deleted) {
+    if(IsCurrentEntryDeleted(leaf)) {
       index_ ++;
       continue;
     }
