@@ -141,14 +141,18 @@ auto TableHeap::GetTupleMeta(RID rid) -> TupleMeta {
  * There should be no difference between this function and `MakeEagerIterator` in project 4 if everything is
  * implemented correctly. */
 auto TableHeap::MakeIterator() -> TableIterator {
+  // 这个函数的作用是创建一个从表开头遍历到当前表末尾的 TableIterator
   std::unique_lock<std::mutex> guard(latch_);
+  // 保存最后一页的  page_id ， 这里是为了避免在给带过程中边界不稳定
   auto last_page_id = last_page_id_;
-  guard.unlock();
+  guard.unlock();  // 这里读完 last_page_id_ 之后马上释放锁，是为了避免长时间持有 TableHeap 的锁
 
-  auto page_guard = bpm_->ReadPage(last_page_id);
-  auto page = page_guard.As<TablePage>();
-  auto num_tuples = page->GetNumTuples();
-  page_guard.Drop();
+  // {last_page_id, num_tuples} 表示结束位置，最后一个页的第 num_tuples 个位置， 这个结束位置不是实际的 tuple， 而是最后一个 tuple 的下一个位置
+  auto page_guard = bpm_->ReadPage(last_page_id); // 读取最后一页
+  auto page = page_guard.As<TablePage>(); // 从 BufferPool 里面读出来的是一个通用的页面对象，但是现在我们知道这个页面实际存储的是表数据，所以把它解释成 TablePage
+  auto num_tuples = page->GetNumTuples(); // 然后获取最后一页有多少条 tuple
+  page_guard.Drop(); 
+  // 这里构造并返回 TableIterator. 参数的含义是 this， 当前这个 TableHeap 对象
   return {this, {first_page_id_, 0}, {last_page_id, num_tuples}};
 }
 

@@ -32,9 +32,13 @@ class TableIterator {
   friend class Cursor;
 
  public:
+
+  // TableIterator 不可拷贝
   DISALLOW_COPY(TableIterator);
 
   TableIterator(TableHeap *table_heap, RID rid, RID stop_at_rid);
+
+ 
   TableIterator(TableIterator &&) = default;
 
   ~TableIterator() = default;

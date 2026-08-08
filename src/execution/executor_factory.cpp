@@ -48,7 +48,7 @@
 namespace bustub {
 
 /**
- * Creates a new executor given the executor context and plan node.
+ * Creates a new executor given the executor context and plan node.  CreateExecutor() 在整棵树被建立时调用一次，而它自己被 Execute() 调用
  * @param exec_ctx The executor context for the created executor
  * @param plan The plan node that needs to be executed
  * @return An executor for the given plan in the provided context

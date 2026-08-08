@@ -55,14 +55,15 @@ class ExecutionEngine {
                ExecutorContext *exec_ctx) -> bool {
     BUSTUB_ASSERT((txn == exec_ctx->GetTransaction()), "Broken Invariant");
 
-    // Construct the executor for the abstract plan node
+    // Construct the executor for the abstract plan node ， 构造函数在这里被调用，整个查询只调一次
+    // 递归建出整棵 executor 树
     auto executor = ExecutorFactory::CreateExecutor(exec_ctx, plan);
 
     // Initialize the executor
     auto executor_succeeded = true;
 
     try {
-      executor->Init();
+      executor->Init();  // 可能被调用多次， NLJ 会重复 Init 右子树
       PollExecutor(executor.get(), plan, result_set);
       PerformChecks(exec_ctx);
     } catch (const ExecutionException &ex) {
