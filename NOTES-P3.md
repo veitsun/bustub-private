@@ -866,7 +866,8 @@ P3 的大表测试（`_1m` 后缀）会比参考实现慢。功能不受影响�
 |---|---|---|
 | `p3.00-primer` | ✅ | 全靠框架给定（MockScan + Projection），**开工前就是通的** |
 | `p3.01-seqscan` | ✅ | SeqScan |
-| `p3.02`~ `p3.19` | ❌ | 见任务清单 |
+| `p3.02-insert` | ✅ | Insert + SeqScan 谓词下推 |
+| `p3.03`~ `p3.19` | ❌ | 见任务清单 |
 
 ---
 
@@ -1029,11 +1030,54 @@ SeqScanExecutor
             └─ MakeIterator() / GetTuple(rid)  → BufferPoolManager::ReadPage  ← 我的 P1
 ```
 
-#### 暂时没做
+#### 谓词下推：`filter_predicate_` 的处理 ✅
 
-`plan_->filter_predicate_` 还没处理。`p3.01` 的四条查询都没 `WHERE`，此时是 `nullptr`。
-等 `p3.06-empty-table` 和 `OptimizeMergeFilterScan` 生效后再补
-（补时注意：SeqScan **没有子节点**，求值要用 `GetOutputSchema()`）。
+**这不是「要不要做的性能优化」，而是强制的正确性依赖。** 原因在优化器这一步：
+
+```28:47:src/optimizer/merge_filter_scan.cpp
+auto Optimizer::OptimizeMergeFilterScan(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef {
+  ...
+  if (optimized_plan->GetType() == PlanType::Filter) {
+    ...
+    if (child_plan.GetType() == PlanType::SeqScan) {
+      if (seq_scan_plan.filter_predicate_ == nullptr) {
+        return std::make_shared<SeqScanPlanNode>(filter_plan.output_schema_, seq_scan_plan.table_oid_,
+                                                 seq_scan_plan.table_name_, filter_plan.GetPredicate());
+      }
+    }
+  }
+  return optimized_plan;
+}
+```
+
+这条规则是**框架给定、无条件执行**的：不管 `SeqScanExecutor` 有没有实现谓词求值，
+它都会把 `Filter(SeqScan)` 两层节点合并成一层 `SeqScan{filter_predicate_=谓词}`，
+**独立的 `Filter` 节点从计划树里彻底消失**。
+
+**后果**：合并已经在优化阶段发生，如果 `SeqScanExecutor::Next()` 不读 `filter_predicate_`
+去求值，就没有任何算子会执行这个 `WHERE` 了——不是变慢，是条件**直接消失**，
+所有行（不管满不满足条件）都会原样吐出去。不崩、不报错，典型的「结果错但不崩」。
+
+**实现**（SeqScan 没有子节点，求值要用自己的 `GetOutputSchema()`）：
+
+```cpp
+auto predicate = plan_->filter_predicate_;
+while (!iter_->IsEnd()) {
+  auto [meta, tuple] = iter_->GetTuple();
+  ...
+  if (predicate != nullptr) {
+    auto value = predicate->Evaluate(&tuple, GetOutputSchema());
+    if (value.IsNull() || !value.GetAs<bool>()) { continue; }  // 不满足，跳过这行
+  }
+  tuple_batch->push_back(tuple);
+  ...
+}
+```
+
+**如何暴露的**：`p3.01` 四条查询都没 `WHERE`（此时 `filter_predicate_ = nullptr`），测不出来；
+`p3.02-insert.slt` 里 `insert into t2 select * from t1 where v1 <= 2`
+（期望只插 6 行）在漏处理时把全表 10 行都插进去了，因为 `Filter` 节点已经被合并消失，
+`WHERE` 相当于形同虚设。
 
 
 ---
@@ -1042,7 +1086,24 @@ SeqScanExecutor
 
 > 只记**真正踩过并验证过**的坑，附症状与定位方法。
 
-### （待填）
+### 坑 1：漏处理 `filter_predicate_`，`WHERE` 条件被无声吞掉
+
+**现象**：`insert into t2 select * from t1 where v1 <= 2` 期望插入 6 行，实际把全表 10 行都插了进去；
+`where v1 != v1`（期望 0 行）实际插入了 10 行。
+
+**根因**：`OptimizeMergeFilterScan`（框架给定）无条件把`Filter(SeqScan)` 合并成
+`SeqScan{filter_predicate_=谓词}`，独立的 `Filter` 节点从计划树消失；
+`SeqScanExecutor::Next()` 没有读`filter_predicate_` 求值，导致这个谓词没人执行。
+
+**为什么难查**：不崩、不报错；`p3.01` 全是无 `WHERE` 的查询，测不出来；
+只有真正带 `WHERE` 的语句才暴露，且现象是「结果多了几行」而非报错。
+
+**修复**：`Next()` 里对每一行 `predicate->Evaluate(&tuple, GetOutputSchema())`，
+不满足（`IsNull()` 或 `false`）就 `continue` 跳过（详见上面「谓词下推」小节）。
+
+**可复用的定位手法**：`EXPLAIN` 看优化后的计划树，确认原来的 `Filter` 节点是否已被合并进
+`SeqScan`/其他节点；凡是「结果多了/少了几行但没报错」，先怀疑某个过滤条件是不是被优化器
+挪了位置之后没人真正执行。
 
 <!-- 模板：
 ### 坑 N：<一句话症状>

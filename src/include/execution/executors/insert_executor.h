@@ -15,6 +15,7 @@
 #include <memory>
 #include <vector>
 
+#include "catalog/catalog.h"
 #include "execution/executor_context.h"
 #include "execution/executors/abstract_executor.h"
 #include "execution/plans/insert_plan.h"
@@ -41,7 +42,13 @@ class InsertExecutor : public AbstractExecutor {
 
  private:
   /** The insert plan node to be executed*/
-  const InsertPlanNode *plan_;
+  const InsertPlanNode *plan_;  // 通过 plan_ 可以知道目标表， 然后调用目标表的 TableHeap::InsertTuple() , 由 TableHeap 决定物理位置，并返回 RID
+
+  std::unique_ptr<AbstractExecutor> child_executor_;   // 构造函数传进来的要保存起来，child_executor_ 每次都会给一批 tuple
+  std::shared_ptr<TableInfo> table_info_;   // 目标表
+  std::vector<std::shared_ptr<IndexInfo>> indexes_;   // 该表的所有索引，构造时查一次
+
+  bool done_ = false;
 };
 
 }  // namespace bustub

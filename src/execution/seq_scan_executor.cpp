@@ -49,6 +49,8 @@ auto SeqScanExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<
 
   // 扫描进度就在 iter_ 里，所以不需要额外的 offset 断点
   // 这里的 iter_ 是 SeqScanExecutor 里的成员变量，用来表示当前扫描到表中的哪个位置。 每次 Next() ，都会从上一次停止的位置继续扫描
+  auto predicate = plan_->filter_predicate_;
+
   while(!iter_->IsEnd()) {
     auto [meta, tuple] = iter_->GetTuple();
     auto rid = iter_->GetRID(); // 这里为什么需要知道 RID， 因为很多后续操作可能需要知道 tuple 的位置，
@@ -58,6 +60,14 @@ auto SeqScanExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<
       continue;
     }
 
+    // 谓词下推：filter_predicate_ 由 OptimizeMergeFilterScan 塞进来，SeqScan 没有子节点，
+    // 求值要用自己的 GetOutputSchema()
+    if(predicate != nullptr) {
+      auto value = predicate->Evaluate(&tuple, GetOutputSchema());
+      if(value.IsNull() || !value.GetAs<bool>()) {
+        continue;
+      }
+    }
 
     tuple_batch->push_back(tuple);
     rid_batch->push_back(rid);
