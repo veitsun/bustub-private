@@ -55,13 +55,13 @@ struct TableInfo {
   TableInfo(Schema schema, std::string name, std::unique_ptr<TableHeap> &&table, table_oid_t oid)
       : schema_{std::move(schema)}, name_{std::move(name)}, table_{std::move(table)}, oid_{oid} {}
   /** The table schema */
-  Schema schema_;
+  Schema schema_;  // 这张表的列定义（类型，偏移）
   /** The table name */
-  const std::string name_;
+  const std::string name_;  // 表名
   /** An owning pointer to the table heap */
-  std::unique_ptr<TableHeap> table_;
+  std::unique_ptr<TableHeap> table_;  // 真正的物理存储句柄
   /** The table OID */
-  const table_oid_t oid_;
+  const table_oid_t oid_; // 这是表的唯一编号
 };
 
 /**
@@ -88,11 +88,11 @@ struct IndexInfo {
         is_primary_key_{is_primary_key},
         index_type_(index_type) {}
   /** The schema for the index key */
-  Schema key_schema_;
+  Schema key_schema_;  // 索引 key 的 schema （只含被索引的列）
   /** The name of the index */
   std::string name_;
   /** An owning pointer to the index */
-  std::unique_ptr<Index> index_;
+  std::unique_ptr<Index> index_;  // 真正的索引对象（背后是 B+ Tree）
   /** The unique OID for the index */
   index_oid_t index_oid_;
   /** The name of the table on which the index is created */

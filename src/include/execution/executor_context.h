@@ -30,6 +30,8 @@ class AbstractExecutor;
  * ExecutorContext stores all the context necessary to run an executor.
  */
 class ExecutorContext {
+  // 这次查询执行所需要的全局资源的一个只读句柄集合
+  // ExecutorContext 自己不拥有它们（生命周期由系统级别的对象管理），它只是把这些散落各处的全局单例"打包"传给每一个 executor，让每个 executor 不用各自持有一堆指针参数。
  public:
   /**
    * Creates an ExecutorContext for the transaction that is executing the query.

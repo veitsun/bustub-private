@@ -52,7 +52,7 @@ class UpdateExecutor : public AbstractExecutor {
   /** The child executor to obtain value from */
   std::unique_ptr<AbstractExecutor> child_executor_;
 
-  std::vector<std::shared_ptr<IndexInfo>> indexes_;
+  std::vector<std::shared_ptr<IndexInfo>> indexes_; //  这是一个 vector， 因为一张表可能建了多个索引（比如同时对 id 和 name 建索引）， 
   bool done_ = false;
 };
 }  // namespace bustub

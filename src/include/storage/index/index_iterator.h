@@ -37,6 +37,15 @@ class IndexIterator {
   // IndexIterator();
   ~IndexIterator();  // NOLINT
 
+  // guard_ 是 move-only 的 ReadPageGuard，隐式拷贝构造会被删除；而用户声明了析构函数会
+  // 抑制隐式移动构造的生成 —— 两条规则叠加，导致这个类默认既不可拷贝也不可移动。
+  // P3 的 IndexScanExecutor 需要把迭代器存成 std::optional<IndexIterator> 成员以跨次 Next() 调用，
+  // 必须显式声明移动构造/移动赋值（和 P2 的 TableIterator 用的是同一个套路）。
+  IndexIterator(const IndexIterator &) = delete;
+  auto operator=(const IndexIterator &) -> IndexIterator & = delete;
+  IndexIterator(IndexIterator &&) noexcept = default;
+  auto operator=(IndexIterator &&) noexcept -> IndexIterator & = default;
+
   IndexIterator(std::shared_ptr<TracedBufferPoolManager> bpm, ReadPageGuard guard, page_id_t page_id, int index, KeyComparator comparator); // ReadPageGuard 是 move-only 类型，不能拷贝，所以参数按值接收是可以的，但调用方必须 std::move()
 
   auto IsEnd() -> bool;

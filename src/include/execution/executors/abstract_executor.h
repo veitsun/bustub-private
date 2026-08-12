@@ -51,6 +51,7 @@ class AbstractExecutor {
       -> bool = 0;
 
   /** @return The schema of the tuples that this executor produces */
+  // 这是每个 executor 的对外声明， 我产出的 tuple， 配套的 schema 是这个
   virtual auto GetOutputSchema() const -> const Schema & = 0;
 
   /** @return The executor context in which this executor runs */
@@ -58,6 +59,6 @@ class AbstractExecutor {
 
  protected:
   /** The executor context in which the executor runs */
-  ExecutorContext *exec_ctx_;
+  ExecutorContext *exec_ctx_; // 它是 executor 访问系统资源的唯一途径
 };
 }  // namespace bustub

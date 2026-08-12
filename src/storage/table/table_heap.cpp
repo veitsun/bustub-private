@@ -115,6 +115,7 @@ void TableHeap::UpdateTupleMeta(const TupleMeta &meta, RID rid) {
  * @return the meta and tuple
  */
 auto TableHeap::GetTuple(RID rid) -> std::pair<TupleMeta, Tuple> {
+  // 回表，拿着位置去表
   auto page_guard = bpm_->ReadPage(rid.GetPageId());
   auto page = page_guard.As<TablePage>();
   auto [meta, tuple] = page->GetTuple(rid);
