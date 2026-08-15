@@ -52,7 +52,54 @@ auto GenerateSortKey(const Tuple &tuple, const std::vector<OrderBy> &order_bys, 
  */
 auto ReconstructTuple(const Schema *schema, const Tuple &base_tuple, const TupleMeta &base_meta,
                       const std::vector<UndoLog> &undo_logs) -> std::optional<Tuple> {
-  UNIMPLEMENTED("not implemented");
+
+  // 这个函数的作用是把一行数据“倒带” 到过去某个时刻的样子
+  // 历史修改都被“反向记录” 成了 undolog  ， 每条 undo log 不是记录改成了什么， 而是记录改之前是什么样
+  // ReconstructTuple 就是拿着这些"改之前的样子"，从最新帧一路倒着回放，把每一列逐步恢复成更早的值，最终得到你要看的那个历史版本。
+
+
+
+  // 1. 从 base tuple 提取所有列的值（这些值会随回放逐步被"倒带"成更早的版本）。
+  std::vector<Value> values;
+  values.reserve(schema->GetColumnCount());
+  for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+    values.push_back(base_tuple.GetValue(schema, i));
+  }
+
+  // 2. base 版本的删除标记。
+  bool deleted = base_meta.is_deleted_;
+
+  // 3. 从新到旧依次应用每条 undo log：把被改的列"撤销"回旧值，并更新删除标记。
+  for (const auto &log : undo_logs) {
+    // 构造"只含被改列"的紧凑 schema，用于从 log.tuple_（紧凑存储）按序取值。
+    std::vector<uint32_t> modified_cols;
+    modified_cols.reserve(schema->GetColumnCount());
+    for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+      if (log.modified_fields_[i]) {
+        modified_cols.push_back(i);
+      }
+    }
+    auto undo_schema = Schema::CopySchema(schema, modified_cols);   // 从原始 schema 里挑出“被修改的那几列”， 构造一个新的，只含这些列的紧凑 schema
+
+    // 游标 j 指向 log.tuple_ 里的第 j 个值（紧凑排列，只含被改列）。
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+      if (log.modified_fields_[i]) {
+        values[i] = log.tuple_.GetValue(&undo_schema, j);
+        j++;
+      }
+    }
+
+    // 每条 log 精确描述"回放到这一步时 tuple 的删除状态"，必须直接赋值（而非 |=），
+    // 这样"删除后又插入"（复活）的场景才能正确处理。
+    deleted = log.is_deleted_;
+  }
+
+  // 4. 回放到最后若仍是删除态，说明该行对调用方"已删除/不存在"。
+  if (deleted) {
+    return std::nullopt;
+  }
+  return Tuple(values, schema);
 }
 
 /**
@@ -67,9 +114,45 @@ auto ReconstructTuple(const Schema *schema, const Tuple &base_tuple, const Tuple
  * @return An optional vector of undo logs to pass to ReconstructTuple(). std::nullopt if the tuple did not exist at the
  * time.
  */
+auto IsVisible(timestamp_t ts, Transaction *txn) -> bool {
+  // 情况1：这是我自己的临时时间戳 → 我刚写的，一定可见。
+  // 临时时间戳和普通时间戳的区别就只有一点 ， 最高位是 0 就是 普通时间戳，最高位是 1 就是临时时间戳
+  if (ts == txn->GetTransactionTempTs()) {
+    return true;
+  }
+  // 情况2：是某个其他事务的临时时间戳（>= TXN_START_ID）→ 别人未提交的脏数据，不可见。
+  if (ts >= TXN_START_ID) {
+    return false;
+  }
+  // 情况3：正常已提交时间戳 → 只有 <= 我的 read_ts_（在我开始读之前提交）才可见。
+  return ts <= txn->GetReadTs();
+}
+
+
+// 给定一行数据，找出“当前事务 T 能看到那个历史版本” 需要回放哪些 undo log
 auto CollectUndoLogs(RID rid, const TupleMeta &base_meta, const Tuple &base_tuple, std::optional<UndoLink> undo_link,
                      Transaction *txn, TransactionManager *txn_mgr) -> std::optional<std::vector<UndoLog>> {
-  UNIMPLEMENTED("not implemented");
+  // 情况1：base tuple 本身对当前事务可见 → 无需任何 undo log，直接返回空 vector
+  //（配合 base_tuple 直接使用，无需回放历史）。
+  if (IsVisible(base_meta.ts_, txn)) {
+    return std::vector<UndoLog>{};
+  }
+
+  // 情况2/3：base tuple 不可见，沿版本链从新到旧收集 undo log，
+  // 直到找到第一条可见的日志（连同它一起收集，用于回放时"抹平"更新版本带来的差异）。
+  std::vector<UndoLog> logs;
+  auto link = undo_link;  // undo_link 是这行版本链的入口
+  while (link.has_value() && link->IsValid()) {
+    auto log = txn_mgr->GetUndoLog(*link);  // 取这一节日志
+    logs.push_back(log);      // 收集，先收进来再说
+    if (IsVisible(log.ts_, txn)) {
+      return logs;    // 找到可见版本就停
+    }
+    link = log.prev_version_;  // 没找到继续往前
+  }
+
+  // 走到链表尽头都没找到可见版本 → 该行对当前事务"根本不存在"。
+  return std::nullopt;  // 把整条版本链从头走到尾， 没有任何一个版本的 ts_ <= read_ts_ 说明这行是在我开始读之后才被插入的，在我的快照世界里它还没出生，所以返回 nullopt
 }
 
 /**

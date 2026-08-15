@@ -72,15 +72,15 @@ struct UndoLink {
 
 struct UndoLog {
   /* Whether this log is a deletion marker */
-  bool is_deleted_;
+  bool is_deleted_;   // 这个版本是不是被删除状态，回放时判断这行在那一刻是否已删除
   /* The fields modified by this undo log */
-  std::vector<bool> modified_fields_;
+  std::vector<bool> modified_fields_; // 哪些列被这次修改动了， 回放时知道要覆盖哪些列
   /* The modified fields */
-  Tuple tuple_;
+  Tuple tuple_;   // 被改动的那些列的旧值（紧凑存储，只含改动的列）， 回放时用这些旧值覆盖回去
   /* Timestamp of this undo log */
-  timestamp_t ts_{INVALID_TS};
+  timestamp_t ts_{INVALID_TS};  // 这个旧版本原来的时间戳， 用来做可见性判断
   /* Undo log prev version */
-  UndoLink prev_version_{};
+  UndoLink prev_version_{};  // 指向更早一条 undo log 的坐标
 };
 
 /**
@@ -176,8 +176,11 @@ class Transaction {
   std::atomic<TransactionState> state_{TransactionState::RUNNING};
 
   /** The read ts */
-  std::atomic<timestamp_t> read_ts_{0};
+  // 事务在 Begin() 那一刻记录下来的“快照时间点”， 值 = 当时系统的 last_conmmit_ts_ (已提交事务里的最大时间戳)
+  // 对于任意一条记录，看它的时间戳 ts_ 和当前事务 read_ts_ 的关系
+  std::atomic<timestamp_t> read_ts_{0};  // 代表的是我看到的世界的快照时刻
 
+  // 这里有 read_ts_ 和 commit_ts_ 两个时间戳，对应事务生命周期的两端， commit_ts_ 代表的是我的修改对外生效的时刻
   /** The commit ts */
   std::atomic<timestamp_t> commit_ts_{INVALID_TS};
 

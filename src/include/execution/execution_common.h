@@ -62,6 +62,16 @@ auto GenerateUpdatedUndoLog(const Schema *schema, const Tuple *base_tuple, const
 void TxnMgrDbg(const std::string &info, TransactionManager *txn_mgr, const TableInfo *table_info,
                TableHeap *table_heap);
 
+/**
+ * @brief 判断一个时间戳（base tuple 的 ts_ 或某条 undo log 的 ts_）对给定事务是否可见。
+ *
+ * 快照隔离的核心规则：
+ *  - ts 是当前事务自己的临时时间戳 → 可见（自己刚写的）。
+ *  - ts >= TXN_START_ID（即另一个事务的临时时间戳）→ 不可见（别人未提交的脏数据）。
+ *  - 否则是已提交的正常时间戳：ts <= txn 的 read_ts_ 才可见。
+ */
+auto IsVisible(timestamp_t ts, Transaction *txn) -> bool;
+
 // TODO(P4): Add new functions as needed... You are likely need to define some more functions.
 //
 // To give you a sense of what can be shared across executors / transaction manager, here are the

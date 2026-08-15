@@ -47,7 +47,9 @@ auto TransactionManager::Begin(IsolationLevel isolation_level) -> Transaction * 
   auto *txn_ref = txn.get();
   txn_map_.insert(std::make_pair(txn_id, std::move(txn)));
 
-  // TODO(P4): set the timestamps here. Watermark updated below.
+  // read_ts_ 固定为当前系统已提交的最高时间戳：即"我只能看到在我 Begin 之前
+  // 就已经提交的数据"，这正是快照隔离（Snapshot Isolation）的定义。
+  txn_ref->read_ts_ = last_commit_ts_.load();
 
   running_txns_.AddTxn(txn_ref->read_ts_);
   return txn_ref;
@@ -65,7 +67,11 @@ auto TransactionManager::VerifyTxn(Transaction *txn) -> bool { return true; }
 auto TransactionManager::Commit(Transaction *txn) -> bool {
   std::unique_lock<std::mutex> commit_lck(commit_mutex_);
 
-  // TODO(P4): acquire commit ts!
+  // 先"预占"一个 commit ts（此时还没有正式写回 last_commit_ts_，仅在本地计算）。
+  // 之所以能在校验之前就计算好，是因为 commit_mutex_ 保证了同一时刻只有一个事务
+  // 在走 Commit 流程，不会有竞争；即使后面校验失败走 Abort，这个数字也只是被浪费掉，
+  // 时间戳只要求单调递增、不要求连续，所以没有正确性问题。
+  timestamp_t commit_ts = last_commit_ts_.load() + 1;
 
   if (txn->state_ != TransactionState::RUNNING) {
     throw Exception("txn not in running state");
@@ -79,11 +85,15 @@ auto TransactionManager::Commit(Transaction *txn) -> bool {
     }
   }
 
-  // TODO(P4): Implement the commit logic!
+  // TODO(P4 Task#3): 遍历 txn->GetWriteSets()，把这个事务写过的每一行的
+  // TupleMeta.ts_ 从"临时时间戳"改写为正式的 commit_ts（需要 InsertExecutor 等先
+  // 把 write set 填好之后才能验证，这里先留空）。
 
   std::unique_lock<std::shared_mutex> lck(txn_map_mutex_);
 
-  // TODO(P4): set commit timestamp + update last committed timestamp here.
+  // 正式落盘：全局时间戳前进，事务自己的 commit_ts_ 也被钉死。
+  last_commit_ts_.store(commit_ts);
+  txn->commit_ts_.store(commit_ts);
 
   txn->state_ = TransactionState::COMMITTED;
   running_txns_.UpdateCommitTs(txn->commit_ts_);
