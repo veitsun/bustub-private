@@ -153,11 +153,11 @@ auto UpdateTupleAndUndoLink(
  */
 auto GetTupleAndUndoLink(TransactionManager *txn_mgr, TableHeap *table_heap, RID rid)
     -> std::tuple<TupleMeta, Tuple, std::optional<UndoLink>> {
-  auto page_read_guard = table_heap->AcquireTablePageReadLock(rid);
+  auto page_read_guard = table_heap->AcquireTablePageReadLock(rid);  // 拿页读锁
   auto page = page_read_guard.As<TablePage>();
-  auto [meta, tuple] = page->GetTuple(rid);
+  auto [meta, tuple] = page->GetTuple(rid);   // 读 base tuple
 
-  auto undo_link = txn_mgr->GetUndoLink(rid);
+  auto undo_link = txn_mgr->GetUndoLink(rid);   //  读版本链入口
   return std::make_tuple(meta, tuple, undo_link);
 }
 

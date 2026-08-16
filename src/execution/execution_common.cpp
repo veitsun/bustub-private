@@ -236,22 +236,23 @@ void TxnMgrDbg(const std::string &info, TransactionManager *txn_mgr, const Table
 
   // 遍历 table heap 的每个 slot，打印 base tuple + 它的版本链。
   for (auto iter = table_heap->MakeIterator(); !iter.IsEnd(); ++iter) {
-    auto [meta, tuple] = iter.GetTuple();
-    auto rid = iter.GetRID();
+    auto [meta, tuple] = iter.GetTuple();  // 拿到这一行的 base tuple + 元信息
+    auto rid = iter.GetRID();   // 拿到这一行的 rid
 
     // 第一行：base tuple 的 RID、时间戳、删除标记、内容。
     fmt::println(stderr, "RID={}/{} ts={}{} tuple={}", rid.GetPageId(), rid.GetSlotNum(), TsToString(meta.ts_),
-                 meta.is_deleted_ ? " <del marker>" : "", tuple.ToString(schema));
+                 meta.is_deleted_ ? " <del marker>" : "", tuple.ToString(schema)); // tostring 时间戳如果是临时时间戳，打印成 txnN， 普通时间戳打印数字
 
     // 后续行：沿 undo link 从新到旧打印版本链。
-    auto link = txn_mgr->GetUndoLink(rid);
-    while (link.has_value() && link->IsValid()) {
-      auto log_opt = txn_mgr->GetUndoLogOptional(*link);
+    // 沿着版本链打印历史
+    auto link = txn_mgr->GetUndoLink(rid);   // 取这一行版本链的入口
+    while (link.has_value() && link->IsValid()) {   // 还有历史就继续
+      auto log_opt = txn_mgr->GetUndoLogOptional(*link);  
       if (!log_opt.has_value()) {
         break;  // 该日志所属事务已被 GC，链到此为止。
       }
       const auto &log = *log_opt;
-      auto txn_human = link->prev_txn_ ^ TXN_START_ID;
+      auto txn_human = link->prev_txn_ ^ TXN_START_ID;  // 把事务 id 转成 人类可读的 n
       if (log.is_deleted_) {
         fmt::println(stderr, "  txn{}@{} <del> ts={}", txn_human, link->prev_log_idx_, TsToString(log.ts_));
       } else {
