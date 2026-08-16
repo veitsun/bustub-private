@@ -186,30 +186,81 @@ auto GenerateUpdatedUndoLog(const Schema *schema, const Tuple *base_tuple, const
   UNIMPLEMENTED("not implemented");
 }
 
+namespace {
+/** 把时间戳格式化成调试输出：临时时间戳（>= TXN_START_ID）打印成 txnN，普通时间戳打印成数字。 */
+auto TsToString(timestamp_t ts) -> std::string {
+  if (ts >= TXN_START_ID) {
+    return fmt::format("txn{}", ts ^ TXN_START_ID);
+  }
+  return std::to_string(ts);
+}
+
+/** 把 undo log 的紧凑 tuple 展开成调试输出：被修改的列打印值，未修改的列打印 `_`。 */
+auto UndoLogTupleToString(const Schema *schema, const UndoLog &log) -> std::string {
+  // 收集被改列的下标，构造紧凑 schema。
+  std::vector<uint32_t> modified_cols;
+  for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+    if (log.modified_fields_[i]) {
+      modified_cols.push_back(i);
+    }
+  }
+  auto undo_schema = Schema::CopySchema(schema, modified_cols);
+
+  uint32_t j = 0;  // 游标：指向 log.tuple_ 里的第 j 个值（紧凑排列）
+  std::string result = "(";
+  for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+    if (i != 0) {
+      result += ", ";
+    }
+    if (log.modified_fields_[i]) {
+      auto value = log.tuple_.GetValue(&undo_schema, j);
+      j++;
+      result += value.IsNull() ? "<NULL>" : value.ToString();
+    } else {
+      result += "_";
+    }
+  }
+  result += ")";
+  return result;
+}
+}  // namespace
+
 void TxnMgrDbg(const std::string &info, TransactionManager *txn_mgr, const TableInfo *table_info,
                TableHeap *table_heap) {
   // always use stderr for printing logs...
+  // 把每行数据的“版本链” 肉眼可见地打印出来，快速验证 MVCC 逻辑对不对
+  // 验证读/写是否正确： 改完 SeqScan， Update， Delete， 索引后，在关键节点调用 TxnMgrDbg， 肉眼比对版本链是否符合预期--比单步调试快一个数量级
   fmt::println(stderr, "debug_hook: {}", info);
 
-  fmt::println(
-      stderr,
-      "You see this line of text because you have not implemented `TxnMgrDbg`. You should do this once you have "
-      "finished task 2. Implementing this helper function will save you a lot of time for debugging in later tasks.");
+  const auto *schema = &table_info->schema_;
 
-  // We recommend implementing this function as traversing the table heap and print the version chain. An example output
-  // of our reference solution:
-  //
-  // debug_hook: before verify scan
-  // RID=0/0 ts=txn8 tuple=(1, <NULL>, <NULL>)
-  //   txn8@0 (2, _, _) ts=1
-  // RID=0/1 ts=3 tuple=(3, <NULL>, <NULL>)
-  //   txn5@0 <del> ts=2
-  //   txn3@0 (4, <NULL>, <NULL>) ts=1
-  // RID=0/2 ts=4 <del marker> tuple=(<NULL>, <NULL>, <NULL>)
-  //   txn7@0 (5, <NULL>, <NULL>) ts=3
-  // RID=0/3 ts=txn6 <del marker> tuple=(<NULL>, <NULL>, <NULL>)
-  //   txn6@0 (6, <NULL>, <NULL>) ts=2
-  //   txn3@1 (7, _, _) ts=1
+  // 遍历 table heap 的每个 slot，打印 base tuple + 它的版本链。
+  for (auto iter = table_heap->MakeIterator(); !iter.IsEnd(); ++iter) {
+    auto [meta, tuple] = iter.GetTuple();
+    auto rid = iter.GetRID();
+
+    // 第一行：base tuple 的 RID、时间戳、删除标记、内容。
+    fmt::println(stderr, "RID={}/{} ts={}{} tuple={}", rid.GetPageId(), rid.GetSlotNum(), TsToString(meta.ts_),
+                 meta.is_deleted_ ? " <del marker>" : "", tuple.ToString(schema));
+
+    // 后续行：沿 undo link 从新到旧打印版本链。
+    auto link = txn_mgr->GetUndoLink(rid);
+    while (link.has_value() && link->IsValid()) {
+      auto log_opt = txn_mgr->GetUndoLogOptional(*link);
+      if (!log_opt.has_value()) {
+        break;  // 该日志所属事务已被 GC，链到此为止。
+      }
+      const auto &log = *log_opt;
+      auto txn_human = link->prev_txn_ ^ TXN_START_ID;
+      if (log.is_deleted_) {
+        fmt::println(stderr, "  txn{}@{} <del> ts={}", txn_human, link->prev_log_idx_, TsToString(log.ts_));
+      } else {
+        fmt::println(stderr, "  txn{}@{} {} ts={}", txn_human, link->prev_log_idx_,
+                     UndoLogTupleToString(schema, log), TsToString(log.ts_));
+      }
+      link = log.prev_version_;
+    }
+  }
 }
 
 }  // namespace bustub

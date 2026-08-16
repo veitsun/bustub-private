@@ -77,6 +77,8 @@ class TransactionManager {
   std::shared_mutex version_info_mutex_;
   /** Stores the previous version of each tuple in the table heap. Do not directly access this field. Use the helper
    * functions in `transaction_manager_impl.cpp`. */
+   // 这是一个 两层 map ， 通过 RID 定位到每一行的版本链入口
+   // 为什么同故宫 RID 就能知道入口，因为 RID 本身 = (page_id , slot_num), 天然就是定位到 “某页的某个槽位” 的坐标
   std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
 
   /** Stores all the read_ts of running txns so as to facilitate garbage collection. */
