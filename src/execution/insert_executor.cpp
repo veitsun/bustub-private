@@ -68,23 +68,21 @@ auto InsertExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<b
   int32_t count = 0;
   std::vector<Tuple> child_tuples;
   std::vector<RID> child_rids;
+  auto *txn = exec_ctx_->GetTransaction();
 
   // 把子节点彻底抽干
   while(child_executor_->Next(&child_tuples, &child_rids, batch_size)) {
     for(auto &t : child_tuples) {
-      //
-      // count ++;
-      // 插入 tuple到 tuple heap
-      // 得到新 tuple 的 RID 
-      // 更新相关索引
-      // 计数加一
-
-      auto rid_opt = table_info_->table_->InsertTuple(TupleMeta{0, false}, t);
+      // P4: 新插入的 tuple 时间戳设为"我的临时时间戳"（txn_id_），提交时再改写成 commit_ts_。
+      // 新插入的 tuple 不需要 undo log（插入前它不存在，别的老事务会因"不可见 + 无日志"看到 nullopt）。
+      auto rid_opt = table_info_->table_->InsertTuple(TupleMeta{txn->GetTransactionTempTs(), false}, t);
       if(!rid_opt.has_value()) {
         continue; // 页满等异常
       }
       auto rid = rid_opt.value();
 
+      // 记录"我插入了这一行"，提交时要把它的时间戳改写成 commit_ts_。
+      txn->AppendWriteSet(plan_->GetTableOid(), rid);
 
       // 对每一个索引同步插入
       for(auto &idx : indexes_) {

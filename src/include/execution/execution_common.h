@@ -72,6 +72,14 @@ void TxnMgrDbg(const std::string &info, TransactionManager *txn_mgr, const Table
  */
 auto IsVisible(timestamp_t ts, Transaction *txn) -> bool;
 
+/**
+ * @brief 判断"写写冲突"：base tuple 的 ts_ 是否意味着这行已经被"别人"抢先改过。
+ *
+ * 冲突定义：base_ts 不是我自己的临时时间戳，且 base_ts > 我的 read_ts_
+ * （即在我开始读这行之后，有另一个事务已经改了它——不管那个事务提交与否）。
+ */
+auto IsWriteWriteConflict(timestamp_t base_ts, Transaction *txn) -> bool;
+
 // TODO(P4): Add new functions as needed... You are likely need to define some more functions.
 //
 // To give you a sense of what can be shared across executors / transaction manager, here are the

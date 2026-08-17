@@ -102,6 +102,18 @@ auto ReconstructTuple(const Schema *schema, const Tuple &base_tuple, const Tuple
   return Tuple(values, schema);
 }
 
+// 判断当前这行是否已经被别人抢先该过，导致我这个事务不能安全地写它
+auto IsWriteWriteConflict(timestamp_t base_ts, Transaction *txn) -> bool {
+  // base_ts 是这行 base tuple 的当前时间戳 （读到的最新版本是谁写的， 什么时候写的）
+  // 是我自己已经写过的行（base_ts == 我的临时时间戳）→ 不冲突，继续改。
+  if (base_ts == txn->GetTransactionTempTs()) { // 这行是我自己的这个事务刚写的。 不冲突，继续写
+    return false;
+  }
+  // 其他情况（别人的临时时间戳，或已提交但晚于我的 read_ts_）→ 都 > read_ts_，冲突。
+  // read_ts_ = 事务 Begin() 那一刻的快照时间点，值 = 当时的 last_commit_ts_（系统已提交的最高时间戳）：
+  return base_ts > txn->GetReadTs();  // 别人的临时时间戳全都归进冲突，别人（哪怕没提交）抢先动了这一行，我就应该判别冲突
+}
+
 /**
  * @brief Collects the undo logs sufficient to reconstruct the tuple w.r.t. the txn.
  *
@@ -168,7 +180,39 @@ auto CollectUndoLogs(RID rid, const TupleMeta &base_meta, const Tuple &base_tupl
  */
 auto GenerateNewUndoLog(const Schema *schema, const Tuple *base_tuple, const Tuple *target_tuple, timestamp_t ts,
                         UndoLink prev_version) -> UndoLog {
-  UNIMPLEMENTED("not implemented");
+  // 这个函数的作用是生成一条新的 undo log， 记录这次修改之前，这行的旧样子-- 用于事务第一次修改某一行的场景
+  UndoLog log;
+  // is_deleted_ = "这次修改之前，这行是否是被删除状态"（base_tuple == nullptr）。
+  // 回放时 undo log 的 is_deleted_ 会被直接赋值给 deleted 标记，表示"撤销这次修改后"的删除态。
+  log.is_deleted_ = (base_tuple == nullptr);
+  log.ts_ = ts;
+  log.prev_version_ = prev_version;
+
+  // 收集"这次修改中被改动的列"以及它们的旧值（来自 base_tuple）。
+  std::vector<bool> modified_fields(schema->GetColumnCount(), false);
+  std::vector<uint32_t> modified_cols;
+  std::vector<Value> old_values;
+
+  if (base_tuple != nullptr) {
+    for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+      // target_tuple == nullptr 表示删除：整行的旧值都要记录。
+      // 否则是更新：只记录"发生变化"的列。
+      bool changed =
+          (target_tuple == nullptr) ||
+          !base_tuple->GetValue(schema, i).CompareExactlyEquals(target_tuple->GetValue(schema, i));
+      if (changed) {
+        modified_fields[i] = true;
+        modified_cols.push_back(i);
+        old_values.push_back(base_tuple->GetValue(schema, i));
+      }
+    }
+  }
+
+  log.modified_fields_ = std::move(modified_fields);
+  // 用紧凑 schema（只含被改列）构造旧值 tuple；若没有改列（如插入到已删除 slot），则得到空 tuple。
+  auto undo_schema = Schema::CopySchema(schema, modified_cols);
+  log.tuple_ = Tuple(old_values, &undo_schema);
+  return log;
 }
 
 /**
@@ -183,7 +227,53 @@ auto GenerateNewUndoLog(const Schema *schema, const Tuple *base_tuple, const Tup
  */
 auto GenerateUpdatedUndoLog(const Schema *schema, const Tuple *base_tuple, const Tuple *target_tuple,
                             const UndoLog &log) -> UndoLog {
-  UNIMPLEMENTED("not implemented");
+  // 同一个事务第二次修改同一行：把这次"新改的列"合并进已有的 undo log。
+  // undo log 的语义始终是"撤销该事务的所有修改，回到第一次修改前的原始值"，
+  // 所以只往 tuple 里"加东西"，永不删除已有列。
+  UndoLog new_log = log;
+
+  // 1. 更新 modified_fields_：找出这次"新改"的、且之前没被记录过的列。
+  for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+    if (new_log.modified_fields_[i]) {
+      continue;
+    }
+    bool changed = (target_tuple == nullptr) ||
+                   (base_tuple != nullptr &&
+                    !base_tuple->GetValue(schema, i).CompareExactlyEquals(target_tuple->GetValue(schema, i)));
+    if (changed) {
+      new_log.modified_fields_[i] = true;
+    }
+  }
+
+  // 2. 按列下标升序重新构造紧凑 tuple（保证与 modified_fields_ 的顺序一一对应）。
+  //    旧 log 里已记录的列取旧值；新改的列取 base_tuple 的值（第一次没改它，所以 base 里的值就是原始值）。
+  std::vector<uint32_t> old_cols;
+  for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+    if (log.modified_fields_[i]) {
+      old_cols.push_back(i);
+    }
+  }
+  auto old_schema = Schema::CopySchema(schema, old_cols);   // 用来从旧 log 的紧凑 tuple_ 里取出旧值
+
+  std::vector<Value> values;
+  std::vector<uint32_t> all_cols;
+  uint32_t old_j = 0;
+  for (uint32_t i = 0; i < schema->GetColumnCount(); i++) {
+    if (!new_log.modified_fields_[i]) {
+      continue;
+    }
+    all_cols.push_back(i);
+    if (log.modified_fields_[i]) {
+      values.push_back(log.tuple_.GetValue(&old_schema, old_j));
+      old_j++;
+    } else {
+      values.push_back(base_tuple->GetValue(schema, i));
+    }
+  }
+
+  auto all_schema = Schema::CopySchema(schema, all_cols);
+  new_log.tuple_ = Tuple(values, &all_schema);
+  return new_log;
 }
 
 namespace {

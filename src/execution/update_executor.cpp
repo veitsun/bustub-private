@@ -15,8 +15,11 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include "common/exception.h"
 #include "common/macros.h"
 #include "common/rid.h"
+#include "concurrency/transaction_manager.h"
+#include "execution/execution_common.h"
 #include "storage/table/tuple.h"
 #include "type/value.h"
 #include "type/value_factory.h"
@@ -59,7 +62,6 @@ void UpdateExecutor::Init() {
  */
 auto UpdateExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<bustub::RID> *rid_batch,
                           size_t batch_size) -> bool {
-  // UNIMPLEMENTED("TODO(P3): Add implementation.");
   tuple_batch->clear();
   rid_batch->clear();
 
@@ -67,62 +69,92 @@ auto UpdateExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<b
     return false;
   }
   done_ = true;
-  /**
-  UPDATE student
-  SET age = age + 1
-  WHERE id = 10;
-   */
+
+  auto *txn = exec_ctx_->GetTransaction();
+  auto *txn_mgr = exec_ctx_->GetTransactionManager();
+  auto *table_heap = table_info_->table_.get();
+  const auto *schema = &table_info_->schema_;
 
   int32_t count = 0;
   std::vector<Tuple> child_tuples;
   std::vector<RID> child_rids;
 
+  // 先拉完所有 (rid, 旧值) 对（pipeline breaker）。因为 Update 的子节点往往是 SeqScan， 而 Update 会原地改这些行。 如果边扫边改，扫描迭代器会陷入改了自己正在扫的行的混乱
+  std::vector<std::pair<RID, Tuple>> updates;
   while (child_executor_->Next(&child_tuples, &child_rids, batch_size)) {
-    // 找到 满足 where 条件的旧 tuple
-    for(size_t i = 0; i < child_tuples.size(); ++i) {
-      // 
-      auto &old_tuple = child_tuples[i];
-      auto &old_rid = child_rids[i];
-
-      // 根据 SET 表达式生成新 tuple
-      std::vector<Value> new_values;
-      new_values.reserve(plan_->target_expressions_.size());
-      for(auto &expr : plan_ -> target_expressions_) {
-        new_values.push_back(expr->Evaluate(&old_tuple, child_executor_->GetOutputSchema()));
-      }
-
-      Tuple new_tuple(new_values, &table_info_->schema_);
-
-      // 先删旧索引项
-      for(auto &idx : indexes_) {
-        auto old_key = old_tuple.KeyFromTuple(table_info_->schema_, idx->key_schema_, idx->index_->GetKeyAttrs());
-        idx->index_->DeleteEntry(old_key, old_rid, exec_ctx_->GetTransaction());
-      }
-
-      // 堆里逻辑删除旧行 + 插入新行 → 拿到新 RID（RID 会变！）
-      table_info_->table_->UpdateTupleMeta(TupleMeta{0, true}, old_rid);
-      auto new_rid_opt = table_info_->table_->InsertTuple(TupleMeta{0, false}, new_tuple);
-      if (!new_rid_opt.has_value()) {
-        continue;
-      }
-      auto new_rid = new_rid_opt.value();
-
-      for (auto &idx : indexes_) {
-        auto new_key = new_tuple.KeyFromTuple(table_info_->schema_, idx->key_schema_, idx->index_->GetKeyAttrs());
-        idx->index_->InsertEntry(new_key, new_rid, exec_ctx_->GetTransaction());
-      }
-      
-
-      count ++;
+    for (size_t i = 0; i < child_tuples.size(); ++i) {
+      updates.emplace_back(child_rids[i], child_tuples[i]);
     }
+  }
+
+  for (auto &[old_rid, old_tuple] : updates) {
+    // 根据 SET 表达式基于"我看到的旧值"生成新 tuple。
+    std::vector<Value> new_values;
+    // target_expressions_ 是 Update 计划里每个目标列的新值表达式，它的数量正好等于表的列数
+    new_values.reserve(plan_->target_expressions_.size());
+    for (auto &expr : plan_->target_expressions_) {
+      new_values.push_back(expr->Evaluate(&old_tuple, child_executor_->GetOutputSchema()));
+    }
+    Tuple new_tuple(new_values, &table_info_->schema_);  // 用算出的新值构造出新 tuple
+
+    // 原子读取 base tuple + 版本链入口（用于冲突检测 + 生成 undo log）。
+    auto [meta, base_tuple, undo_link] = GetTupleAndUndoLink(txn_mgr, table_heap, old_rid);
+
+    // meta 是通过 GetTupleAndUndoLink 读到的这一行（old_rid） 当前 base tuple 的元信息， meta.ts_  就是这行现在最新版本是谁，什么时候写的
+    // txn 当前执行 update 的这个事务
+    // 写写冲突检测。
+    // 这行是我写的（meta.ts_ == 我的临时ts）？        → 不冲突
+    // 这行是别人写、且晚于我读（meta.ts_ > 我的read_ts_）？ → 冲突
+    // 这行是别人写、但早于我读（meta.ts_ <= 我的read_ts_）？→ 不冲突
+    // 判断这行是不是被我读之后的别人抢先改了
+    if (IsWriteWriteConflict(meta.ts_, txn)) {
+      txn->SetTainted();
+      throw ExecutionException("update: write-write conflict on rid " + old_rid.ToString());
+    }
+
+    // 什么是我插入的行： 这行数据是我这个事务用 Insert 刚刚造出来的，在我插入之前，表里根本没有这一行
+    // 什么是别人的行，这行数据在我这个事务开始之前就已经存在于表里了，是别人（之前事务） 写进去的
+    // 三分支判断（同 DeleteExecutor）： 用于判断这次修改，该怎么处理 undo log 
+    //   1) 我插入的行 → 不生成 undo log。
+    //   2) 我已改过的行 → 合并已有 undo log。
+    //   3) 别人的行 → 生成新 undo log。
+    bool is_my_temp_ts = (meta.ts_ == txn->GetTransactionTempTs());
+    bool is_my_undo_link = undo_link.has_value() && undo_link->IsValid() &&
+                           undo_link->prev_txn_ == txn->GetTransactionId();
+
+    if (is_my_temp_ts && !is_my_undo_link) {
+      // 我插入的行：不生成 undo log，undo_link 保持原样（无效）。
+    } else if (is_my_temp_ts && is_my_undo_link) {
+      // 已改过：合并差异到已有 undo log。
+      auto old_log = txn->GetUndoLog(undo_link->prev_log_idx_);
+      auto updated_log = GenerateUpdatedUndoLog(schema, &base_tuple, &new_tuple, old_log);
+      txn->ModifyUndoLog(undo_link->prev_log_idx_, updated_log);
+    } else {
+      // 别人的行：生成新 undo log，记录修改前的旧值。
+      auto undo_log = GenerateNewUndoLog(schema, &base_tuple, &new_tuple, meta.ts_, undo_link.value_or(UndoLink{}));
+      undo_link = txn->AppendUndoLog(undo_log);
+    }
+
+    // 原地更新 base tuple 为新值（ts 设为临时时间戳）。
+    auto new_meta = TupleMeta{txn->GetTransactionTempTs(), false};
+    // 定义 check 回调， 用来做写锁内的二次冲突校验。 它接收的参数是“写锁内重新读到最新 cur_meta”, 返回“是否可以安全写”
+    auto check = [&](const TupleMeta &cur_meta, const Tuple &, RID, std::optional<UndoLink>) {
+      return !IsWriteWriteConflict(cur_meta.ts_, txn); // 如果最新状态没有冲突（返回 true）， 才允许写
+    };
+    if (!UpdateTupleAndUndoLink(txn_mgr, old_rid, undo_link, table_heap, txn, new_meta, new_tuple, check)) {
+      txn->SetTainted();
+      throw ExecutionException("update: write-write conflict (concurrent) on rid " + old_rid.ToString());
+    }
+
+    txn->AppendWriteSet(plan_->GetTableOid(), old_rid);
+    // 注意：P4 里 Update 采用原地更新；索引列的更新属于 Task #4，这里暂不处理索引。
+    count++;
   }
 
   std::vector<Value> values{ValueFactory::GetIntegerValue(count)};
   tuple_batch->emplace_back(values, &GetOutputSchema());
   rid_batch->emplace_back();
   return true;
-
-
 }
 
 }  // namespace bustub

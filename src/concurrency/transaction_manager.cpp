@@ -65,7 +65,7 @@ auto TransactionManager::VerifyTxn(Transaction *txn) -> bool { return true; }
  * yourself
  */
 auto TransactionManager::Commit(Transaction *txn) -> bool {
-  std::unique_lock<std::mutex> commit_lck(commit_mutex_);
+  std::unique_lock<std::mutex> commit_lck(commit_mutex_);  // 这是全局提交锁
 
   // 先"预占"一个 commit ts（此时还没有正式写回 last_commit_ts_，仅在本地计算）。
   // 之所以能在校验之前就计算好，是因为 commit_mutex_ 保证了同一时刻只有一个事务
@@ -85,9 +85,20 @@ auto TransactionManager::Commit(Transaction *txn) -> bool {
     }
   }
 
-  // TODO(P4 Task#3): 遍历 txn->GetWriteSets()，把这个事务写过的每一行的
-  // TupleMeta.ts_ 从"临时时间戳"改写为正式的 commit_ts（需要 InsertExecutor 等先
-  // 把 write set 填好之后才能验证，这里先留空）。
+  // P4 Task#3: 遍历 write set，把这个事务写过的每一行的 base tuple 时间戳
+  // 从"临时时间戳"改写为正式的 commit_ts_，使这些修改对"此后开始"的事务可见。
+  // 数据内容不需要动（写的时候已经是新值了），只改时间戳。
+  for (const auto &[table_oid, rids] : txn->GetWriteSets()) {
+    auto table_info = catalog_->GetTable(table_oid);
+    if (table_info == nullptr) {
+      continue;
+    }
+    for (const auto &rid : rids) {
+      auto meta = table_info->table_->GetTupleMeta(rid);
+      meta.ts_ = commit_ts;
+      table_info->table_->UpdateTupleMeta(meta, rid);
+    }
+  }
 
   std::unique_lock<std::shared_mutex> lck(txn_map_mutex_);
 
@@ -120,6 +131,27 @@ void TransactionManager::Abort(Transaction *txn) {
 
 /** @brief Stop-the-world garbage collection. Will be called only when all transactions are not accessing the table
  * heap. */
-void TransactionManager::GarbageCollection() { UNIMPLEMENTED("not implemented"); }
+void TransactionManager::GarbageCollection() {
+  auto watermark = running_txns_.GetWatermark();
+
+  std::unique_lock<std::shared_mutex> lck(txn_map_mutex_);
+  std::vector<txn_id_t> to_remove;
+  for (auto &[txn_id, txn] : txn_map_) {
+    auto state = txn->GetTransactionState();
+    // 仍在运行 / 已被污染（TAINTED）的事务不能回收：它们的 read_ts_ 还占着 watermark，
+    // 且它们的 undo log 仍可能被别的事务回放需要。
+    if (state == TransactionState::RUNNING || state == TransactionState::TAINTED) {
+      continue;
+    }
+    // COMMITTED / ABORTED：无 undo log 的事务直接回收（纯插入/原地修改，历史无需保留）；
+    // 有 undo log 的事务，只有当 commit_ts_ < watermark（所有活跃事务都能直接看到它的修改）时才回收。
+    if (txn->GetUndoLogNum() == 0 || txn->GetCommitTs() < watermark) {
+      to_remove.push_back(txn_id);
+    }
+  }
+  for (auto txn_id : to_remove) {
+    txn_map_.erase(txn_id);
+  }
+}
 
 }  // namespace bustub
