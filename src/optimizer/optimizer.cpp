@@ -25,8 +25,8 @@ auto Optimizer::Optimize(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef
     p = OptimizeMergeFilterNLJ(p);
     p = OptimizeNLJAsIndexJoin(p);
     p = OptimizeOrderByAsIndexScan(p);
-    p = OptimizeMergeFilterScan(p);
-    p = OptimizeSeqScanAsIndexScan(p);
+    p = OptimizeMergeFilterScan(p);     // 这里先谓词下推到 SeqScan
+    p = OptimizeSeqScanAsIndexScan(p);    // 再把 SeqScan 转成 IndexScan
     return p;
   }
   // By default, use user-defined rules.

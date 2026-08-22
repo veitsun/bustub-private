@@ -353,11 +353,11 @@ auto BusTubInstance::ExecuteSqlTxn(const std::string &sql, ResultWriter &writer,
 
     // Plan the query.
     bustub::Planner planner(*catalog_);
-    planner.PlanQuery(*statement);
+    planner.PlanQuery(*statement);  // 这里生成初始逻辑计划树
 
     // Optimize the query.
     bustub::Optimizer optimizer(*catalog_, IsForceStarterRule());
-    auto optimized_plan = optimizer.Optimize(planner.plan_);
+    auto optimized_plan = optimizer.Optimize(planner.plan_);  // 套用规则改写
 
     l.unlock();
 
@@ -367,6 +367,7 @@ auto BusTubInstance::ExecuteSqlTxn(const std::string &sql, ResultWriter &writer,
       exec_ctx->InitCheckOptions(std::move(check_options));
     }
     std::vector<Tuple> result_set{};
+    // 执行优化后的计划
     is_successful &= execution_engine_->Execute(optimized_plan, &result_set, txn, exec_ctx.get());
 
     // Return the result set as a vector of string.

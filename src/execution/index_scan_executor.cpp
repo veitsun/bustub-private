@@ -12,6 +12,8 @@
 
 #include "execution/executors/index_scan_executor.h"
 #include "common/macros.h"
+#include "concurrency/transaction_manager.h"
+#include "execution/execution_common.h"
 
 namespace bustub {
 
@@ -70,6 +72,21 @@ auto IndexScanExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vecto
   rid_batch->clear();
 
   auto predicate = plan_->filter_predicate_;  // 这个是额外的筛选条件
+  auto *txn = exec_ctx_->GetTransaction();
+  auto *txn_mgr = exec_ctx_->GetTransactionManager();
+  auto *table_heap = table_info_->table_.get();
+  const auto *schema = &table_info_->schema_;
+
+  // 对给定 RID 回表，走版本链取出"当前事务可见的版本"。
+  // 返回 std::nullopt 表示该行对当前事务不可见（不存在/已删除）。
+  auto fetch_visible = [&](RID rid) -> std::optional<Tuple> {
+    auto [meta, tuple, undo_link] = GetTupleAndUndoLink(txn_mgr, table_heap, rid);
+    auto undo_logs = CollectUndoLogs(rid, meta, tuple, undo_link, txn, txn_mgr);
+    if (!undo_logs.has_value()) {
+      return std::nullopt;
+    }
+    return ReconstructTuple(schema, tuple, meta, *undo_logs);
+  };
 
   if (point_lookup_) {
     // 候选 RID 已经在 Init() 里全部收集好，这里只需要逐个回表+ 过滤
@@ -77,21 +94,21 @@ auto IndexScanExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vecto
       // 逐个从 candidate_rids_ 里取位置
       // 拿完这个位置，进度指针往后挪一格，下次从这继续，不会重复拿
       auto rid = candidate_rids_[cursor_++];
-      auto [meta, tuple] = table_info_->table_->GetTuple(rid); // 回表--拿着位置里把这一行完整的数据真正取出来（因为索引卡片上只写了值 和 位置， 没写这一行其他列的内容）
+      auto visible = fetch_visible(rid);
 
-      if (meta.is_deleted_) {
-        // 检查这行是不是已经被删掉但还没真正清理掉的僵尸数据，是的话跳过（数据库删除通常是“打个删除标记”， 不是马上把数据物理抹掉）
+      if (!visible.has_value()) {
+        // 这行对当前事务不可见（不存在 / 已被删除），跳过。
         continue;
       }
       if (predicate != nullptr) {
-        auto value = predicate->Evaluate(&tuple, GetOutputSchema());
+        auto value = predicate->Evaluate(&(*visible), GetOutputSchema());
         if (value.IsNull() || !value.GetAs<bool>()) {
           continue;
         }
       }
 
       // 塞进两个输出列表
-      tuple_batch->push_back(tuple);
+      tuple_batch->push_back(*visible);
       rid_batch->push_back(rid);
 
       if (tuple_batch->size() >= batch_size) {
@@ -111,19 +128,19 @@ auto IndexScanExecutor::Next(std::vector<bustub::Tuple> *tuple_batch, std::vecto
     ++(*iter_);  // 这里一定要先把手指挪到下一个位置，再判断这一行要不要跳过。如果反过来（先判断要跳过就直接 continue， 忘了挪手指）
     // 手指会一直卡在同一个位置不动，程序就会卡死在死循环里
 
-    auto [meta, tuple] = table_info_->table_->GetTuple(rid);
+    auto visible = fetch_visible(rid);
 
-    if (meta.is_deleted_) {
+    if (!visible.has_value()) {
       continue;
     }
     if (predicate != nullptr) {
-      auto pred_value = predicate->Evaluate(&tuple, GetOutputSchema());
+      auto pred_value = predicate->Evaluate(&(*visible), GetOutputSchema());
       if (pred_value.IsNull() || !pred_value.GetAs<bool>()) {
         continue;
       }
     }
 
-    tuple_batch->push_back(tuple);
+    tuple_batch->push_back(*visible);
     rid_batch->push_back(rid);
 
     if (tuple_batch->size() >= batch_size) {
